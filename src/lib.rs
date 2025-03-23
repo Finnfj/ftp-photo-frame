@@ -41,9 +41,9 @@ pub struct QuitEvent;
 
 /// Slideshow loop
 pub fn run(cli: &Cli, sdl: &mut impl Sdl, random: Random) -> FrameResult<()> {
-    let current_image = show_welcome_screen(cli, sdl)?;
+    show_welcome_screen(cli, sdl)?;
 
-    thread::scope::<'_, _, FrameResult<()>>(|_| slideshow_loop(cli, sdl, random, current_image))
+    thread::scope::<'_, _, FrameResult<()>>(|_| slideshow_loop(cli, sdl, random))
 }
 
 fn show_welcome_screen(cli: &Cli, sdl: &mut impl Sdl) -> FrameResult<DynamicImage> {
@@ -81,24 +81,14 @@ fn handle_next_photo_result(
 }
 
 fn display_new_photo(
-    next_photo_result: Result<DynamicImage, SlideshowError>,
-    screen_size: (u32, u32),
-    rotation: Rotation,
+    next_image: &DynamicImage,
     sdl: &mut impl Sdl,
     cli: &Cli,
-    last_change: &mut Instant,
-    current_image: &mut DynamicImage,
 ) -> FrameResult<()> {
-    let next_image = handle_next_photo_result(next_photo_result, screen_size, rotation)?;
-
     log::info!("Slideshow: Received new Photo, displaying...");
     sdl.update_texture(next_image.as_bytes(), TextureIndex::Next)?;
     cli.transition.play(sdl)?;
     sdl.swap_textures();
-
-    *last_change = Instant::now();
-    *current_image = next_image;
-
     Ok(())
 }
 #[derive(PartialEq)]
@@ -120,19 +110,17 @@ fn screen_mode(screenstate: ScreenState) {
 }
 
 enum DisplayMode {
-    Init,
     Show,
     Standby,
 }
 
-const NO_MOTION_STANDBY_DURATION: Duration = Duration::from_secs(60);
+const NO_MOTION_STANDBY_DURATION: Duration = Duration::from_secs(10);
 const GPIO_MOTION: u8 = 23;
 
 fn slideshow_loop(
     cli: &Cli,
     sdl: &mut impl Sdl,
     random: Random,
-    mut current_image: DynamicImage,
 ) -> FrameResult<()> {
     /* Load the first photo as soon as it's ready. */
     let motion_pin: Option<InputPin> = if cli.motionsensor {
@@ -146,9 +134,10 @@ fn slideshow_loop(
     } else {
         None
     };
-    let mut display_mode = DisplayMode::Init;
+    let mut display_mode = DisplayMode::Show;
     let mut last_activation = Instant::now();
-    let mut last_change = Instant::now() - cli.photo_change_interval;
+    let mut last_change = Instant::now() - cli.photo_change_interval; // immediately show any queued photo
+    let mut next_image: Option<DynamicImage> = None;
     let screen_size = sdl.size();
     let (photo_sender, photo_receiver) = mpsc::sync_channel(1);
     const LOOP_SLEEP_DURATION: Duration = Duration::from_millis(100);
@@ -172,48 +161,40 @@ fn slideshow_loop(
                 }
             }
 
-            match display_mode {
-                DisplayMode::Init => {
-                    // Check if new photo is available for display
-                    if let Ok(next_photo_result) = photo_receiver.try_recv() {
-                        display_new_photo(
-                            next_photo_result,
-                            screen_size,
-                            cli.rotation,
-                            sdl,
-                            cli,
-                            &mut last_change,
-                            &mut current_image,
-                        )?;
-                        display_mode = DisplayMode::Show;
-                    } else {
-                        /* next photo is still being fetched and processed, we have to wait for it */
-                        thread_sleep(LOOP_SLEEP_DURATION);
-                    }
+            // In case no image is still queued for display, process the next fetched image if available
+            if next_image.is_none() {
+                if let Ok(next_photo_result) = photo_receiver.try_recv() {
+                    next_image = Some(handle_next_photo_result(next_photo_result, screen_size, cli.rotation)?);
                 }
+            }
 
+            match display_mode {
                 DisplayMode::Show => {
                     if cli.motionsensor {
                         // Long time no motion?
-                        let elapsed_no_motion_duration = Instant::now() - last_activation;
-                        if elapsed_no_motion_duration > NO_MOTION_STANDBY_DURATION {
+                        if (Instant::now() - last_activation) > NO_MOTION_STANDBY_DURATION {
                             log::info!("Slideshow: Long time no motion detected. Command display to enter standby mode.");
                             screen_mode(ScreenState::Standby);
                             display_mode = DisplayMode::Standby;
                             continue;
                         }
                     }
+
+                    // Check if it's time to change the photo
+                    if (Instant::now() - last_change) < cli.photo_change_interval {
+                        thread_sleep(LOOP_SLEEP_DURATION);
+                        continue;
+                    }
+
                     // Check if new photo is available for display
-                    if let Ok(next_photo_result) = photo_receiver.try_recv() {
+                    if next_image.is_some() {
                         display_new_photo(
-                            next_photo_result,
-                            screen_size,
-                            cli.rotation,
+                            next_image.as_ref().unwrap(),
                             sdl,
                             cli,
-                            &mut last_change,
-                            &mut current_image,
                         )?;
+                        next_image = None;
+                        last_change = Instant::now();
                     } else {
                         /* next photo is still being fetched and processed, we have to wait for it */
                         thread_sleep(LOOP_SLEEP_DURATION);
@@ -232,11 +213,6 @@ fn slideshow_loop(
                 }
             }
         };
-        if _loop_result.is_err() {
-            /* Dropping the receiver terminates photo_fetcher_thread loop */
-            drop(photo_receiver);
-        }
-        _loop_result
     })
 }
 
