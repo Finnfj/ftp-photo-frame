@@ -1,0 +1,4 @@
+# cross-rs configuration, see BUILD.md. The stock image does not have the SDL2 libraries for the
+# target architecture, so a slightly extended one is built from docker/Dockerfile.
+[target.aarch64-unknown-linux-gnu]
+dockerfile = "./docker/Dockerfile"
