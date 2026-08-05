@@ -1,6 +1,7 @@
 //! # syno-photo-frame
 //!
-//! syno_photo_frame is a full-screen slideshow app for Synology Photos and Immich albums
+//! syno_photo_frame is a full-screen slideshow app for Synology Photos and Immich albums, and
+//! for photos on an FTP server
 
 pub use {api_client::LoginError, rand::RandomImpl};
 

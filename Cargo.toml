@@ -2,7 +2,7 @@
 name = "syno-photo-frame"
 version = "0.18.2"
 edition = "2024"
-description = "Full-screen slideshow for Synology Photos and Immich albums"
+description = "Full-screen slideshow for Synology Photos and Immich albums, and for FTP servers"
 license = "GPL-3.0-or-later"
 authors = ["Piotr Karasinski"]
 readme = "README.md"
