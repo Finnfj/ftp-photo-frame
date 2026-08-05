@@ -3,6 +3,7 @@ pub use image::{DynamicImage, open};
 use std::thread::{self, JoinHandle};
 
 use anyhow::Result;
+use fast_image_resize::{FilterType as FirFilterType, ResizeAlg, ResizeOptions, Resizer};
 use image::{
     self, GenericImageView,
     imageops::{self, FilterType},
@@ -66,7 +67,12 @@ impl Framed for DynamicImage {
     }
 
     fn resize(&self, new_width: u32, new_height: u32) -> Self {
-        resize_preserving_aspect(self, (new_width, new_height), FilterType::Lanczos3)
+        resize_preserving_aspect(
+            self,
+            (new_width, new_height),
+            ResizeAlg::Convolution(FirFilterType::Lanczos3),
+            FilterType::Lanczos3,
+        )
     }
 
     fn rotate(&self, degrees: Rotation) -> Self {
@@ -139,7 +145,12 @@ fn resize_to_fit_screen(original: &DynamicImage, (x_res, y_res): (u32, u32)) -> 
         /* Image fits perfectly, background not needed. Note that this may still stretch the image
          * by one pixel horizontally or vertically to make a perfect fit when resized dimensions
          * are off by a fraction. */
-        return original.resize_exact(x_res, y_res, FilterType::Lanczos3);
+        return resize_exact_with(
+            original,
+            (x_res, y_res),
+            ResizeAlg::Convolution(FirFilterType::Lanczos3),
+            FilterType::Lanczos3,
+        );
     }
 
     Framed::resize(original, x_res, y_res)
@@ -199,11 +210,21 @@ fn background_fill_threads(
         ),
     );
     let bg_thread1 = thread::spawn(move || {
-        let bg = resize_preserving_aspect(&bg_crop1, (x_res, y_res), FilterType::Nearest);
+        let bg = resize_preserving_aspect(
+            &bg_crop1,
+            (x_res, y_res),
+            ResizeAlg::Nearest,
+            FilterType::Nearest,
+        );
         brighten_and_blur(&bg)
     });
     let bg_thread2 = thread::spawn(move || {
-        let bg = resize_preserving_aspect(&bg_crop2, (x_res, y_res), FilterType::Nearest);
+        let bg = resize_preserving_aspect(
+            &bg_crop2,
+            (x_res, y_res),
+            ResizeAlg::Nearest,
+            FilterType::Nearest,
+        );
         brighten_and_blur(&bg)
     });
     (bg_thread1, bg_thread2)
@@ -217,16 +238,44 @@ fn background_fill_threads(
 fn resize_preserving_aspect(
     original: &DynamicImage,
     bounds: (u32, u32),
-    filter: FilterType,
+    algorithm: ResizeAlg,
+    fallback: FilterType,
 ) -> DynamicImage {
     if original.dimensions() == bounds {
         return original.clone();
     }
 
-    let (new_width, new_height) = Dimensions::from(original.dimensions())
+    let target = Dimensions::from(original.dimensions())
         .resize(Dimensions::from(bounds))
         .to_rounded();
-    original.resize_exact(new_width, new_height, filter)
+    resize_exact_with(original, target, algorithm, fallback)
+}
+
+/// Resizes an image to exactly `(new_width, new_height)`, disregarding the aspect ratio.
+///
+/// Uses [fast_image_resize], which is considerably faster than `image`'s implementation on the
+/// low-powered hardware this application typically runs on. `fallback` selects the `image` filter
+/// used in the unlikely case that the pixel format is not supported by [fast_image_resize] - all
+/// [DynamicImage] variants currently are.
+fn resize_exact_with(
+    original: &DynamicImage,
+    (new_width, new_height): (u32, u32),
+    algorithm: ResizeAlg,
+    fallback: FilterType,
+) -> DynamicImage {
+    /* The destination must have the same pixel type as the source. */
+    let mut resized = DynamicImage::new(new_width, new_height, original.color());
+    /* Alpha is premultiplied around the resize (fast_image_resize does this by default). The only
+     * image with an alpha channel here is the update icon, which gets composited onto a photo
+     * afterwards, so premultiplying is the correct thing to do. */
+    let options = ResizeOptions::new().resize_alg(algorithm);
+    match Resizer::new().resize(original, &mut resized, &options) {
+        Ok(()) => resized,
+        Err(error) => {
+            log::warn!("Fast resize failed ({error}), falling back to image's implementation");
+            original.resize_exact(new_width, new_height, fallback)
+        }
+    }
 }
 
 fn brighten_and_blur_background(background: &DynamicImage) -> DynamicImage {
