@@ -39,6 +39,7 @@ pub mod error;
 pub mod http;
 pub mod logging;
 pub mod sdl;
+pub mod standby;
 
 mod api_client;
 mod api_crates;
