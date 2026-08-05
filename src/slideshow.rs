@@ -159,10 +159,15 @@ fn photo_removed(error: &anyhow::Error) -> bool {
 mod tests {
     use super::*;
 
+    use mockall::predicate::eq;
     use syno_api::dto::List;
 
     use crate::{
-        api_client::syno_client::SynoApiClient,
+        api_client::{
+            ftp_client::{FtpApiClient, FtpPhoto},
+            syno_client::SynoApiClient,
+        },
+        ftp::{InvalidFtpResponse, MockFtpTransport},
         http::{CookieStore, HttpClient, Jar, MockHttpResponse, StatusCode, Url},
         test_helpers::rand::FakeRandom,
         test_helpers::{self, MockHttpClient},
@@ -681,6 +686,87 @@ mod tests {
                 SECOND_PHOTO_CACHE_KEY,
             )]
         );
+    }
+
+    /// The FTP backend reaches [Slideshow] through the same [ApiClient] interface, but reports a
+    /// missing photo through the FTP protocol rather than a HTTP status code
+    #[test]
+    fn get_next_photo_fetches_the_first_ftp_photo() {
+        let mut transport = MockFtpTransport::new();
+        transport.expect_is_connected().return_const(true);
+        transport
+            .expect_retrieve()
+            .with(eq("/Photos/a.jpg"))
+            .return_once(|_| Ok(Bytes::from_static(&[42, 1, 255, 50])));
+        let mut slideshow = new_ftp_slideshow(transport, FakeRandom::default());
+        slideshow.photo_display_sequence = vec![new_ftp_photo("b.jpg"), new_ftp_photo("a.jpg")];
+
+        let result = slideshow.get_next_photo();
+
+        assert_eq!(
+            result.unwrap(),
+            BytesPhoto {
+                bytes: Bytes::from_static(&[42, 1, 255, 50]),
+                info: "".to_string(),
+            }
+        );
+        assert_eq!(
+            slideshow.photo_display_sequence,
+            vec![new_ftp_photo("b.jpg")]
+        );
+    }
+
+    #[test]
+    fn get_next_photo_skips_the_ftp_photo_when_it_was_removed_from_the_directory() {
+        let mut transport = MockFtpTransport::new();
+        transport.expect_is_connected().return_const(true);
+        transport
+            .expect_retrieve()
+            .with(eq("/Photos/missing.jpg"))
+            .return_once(|_| {
+                Err(anyhow::anyhow!(InvalidFtpResponse {
+                    status: suppaftp::Status::FileUnavailable,
+                    message: "No such file or directory".to_string(),
+                }))
+            });
+        transport
+            .expect_retrieve()
+            .with(eq("/Photos/next.jpg"))
+            .return_once(|_| Ok(Bytes::from_static(&[42])));
+        let mut slideshow = new_ftp_slideshow(transport, FakeRandom::default());
+        slideshow.photo_display_sequence = vec![
+            new_ftp_photo("after_next.jpg"),
+            new_ftp_photo("next.jpg"),
+            new_ftp_photo("missing.jpg"),
+        ];
+
+        let result = slideshow.get_next_photo();
+
+        assert_eq!(result.unwrap().bytes, Bytes::from_static(&[42]));
+        assert_eq!(
+            slideshow.photo_display_sequence,
+            vec![new_ftp_photo("after_next.jpg")],
+            "the missing photo must be skipped rather than displayed as an error"
+        );
+    }
+
+    /// The mock is owned by the client, so its expectations are verified when the slideshow is
+    /// dropped instead of through an explicit checkpoint
+    fn new_ftp_slideshow<R: Random>(
+        transport: MockFtpTransport,
+        random: R,
+    ) -> Slideshow<FtpApiClient<MockFtpTransport>, R> {
+        let share_link = Url::parse("ftp://joe@fake.nas/Photos").unwrap();
+        let api_client = FtpApiClient::build(transport, &share_link).unwrap();
+        Slideshow::new(api_client, random, Locale::POSIX, None)
+    }
+
+    fn new_ftp_photo(path: &str) -> FtpPhoto {
+        FtpPhoto {
+            path: path.to_string(),
+            /* No date, so that the info box stays out of these assertions */
+            modified: None,
+        }
     }
 
     fn new_syno_slideshow<'a, H: HttpClient, C: CookieStore, R: Random>(
