@@ -46,11 +46,16 @@ fn init_and_run() -> Result<()> {
      * command is reported before the screen is taken over by the slideshow. */
     let standby = match cli.motion_sensor_gpio {
         None => Standby::disabled(),
-        Some(gpio_pin) => Standby::new(
-            standby::new_motion_sensor(gpio_pin)?,
-            Box::new(CommandDisplayPower::new(&cli.display_power_command)?),
-            cli.motion_sensor_timeout,
-        ),
+        Some(gpio_pin) => {
+            /* The command is validated before the sensor is opened, so that a typo in it is
+             * reported even on a machine that has no GPIO */
+            let display_power = CommandDisplayPower::new(&cli.display_power_command)?;
+            Standby::new(
+                standby::new_motion_sensor(gpio_pin)?,
+                Box::new(display_power),
+                cli.motion_sensor_timeout,
+            )
+        }
     };
 
     /* HTTP client */

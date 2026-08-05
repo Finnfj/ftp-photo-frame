@@ -853,7 +853,7 @@ mod tests {
          * so that it starts counting from the same point in time */
         MockClock::set_time(START_TIME);
         let cli_command = format!(
-            "syno-photo-frame {SHARE_LINK}              --interval {DISPLAY_INTERVAL}              --disable-update-check              --transition none              --splash assets/test_loading.jpeg"
+            "syno-photo-frame {SHARE_LINK} --interval {DISPLAY_INTERVAL} --disable-update-check --transition none --splash assets/test_loading.jpeg"
         );
 
         run(
