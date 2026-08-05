@@ -1,12 +1,12 @@
 use std::{fmt, ops::Deref, sync::OnceLock};
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use bytes::Bytes;
 use regex::Regex;
 
 use crate::{
     cli::{Backend, Order, SourceSize},
-    http::Url,
+    http::{InvalidHttpResponse, StatusCode, Url},
     metadata::Metadata,
 };
 
@@ -37,6 +37,43 @@ impl fmt::Display for LoginError {
 }
 
 impl std::error::Error for LoginError {}
+
+/// A photo is no longer available on the server, most likely because it has been removed from the
+/// album since its metadata was fetched. [crate::slideshow::Slideshow] skips such photos instead of
+/// displaying the error screen.
+///
+/// Backends signal this condition in different ways, so they wrap their own "not found" error in
+/// this type to keep the slideshow independent of any particular protocol.
+#[derive(Debug)]
+pub struct PhotoNotFound(pub anyhow::Error);
+
+impl fmt::Display for PhotoNotFound {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for PhotoNotFound {}
+
+/// Translates a HTTP 404 response into [PhotoNotFound]
+pub(crate) trait PhotoNotFoundMapper<T> {
+    fn map_photo_not_found(self) -> Result<T>;
+}
+
+impl<T> PhotoNotFoundMapper<T> for Result<T> {
+    fn map_photo_not_found(self) -> Result<T> {
+        self.map_err(|error| {
+            if matches!(
+                error.downcast_ref::<InvalidHttpResponse>(),
+                Some(InvalidHttpResponse(StatusCode::NOT_FOUND))
+            ) {
+                anyhow!(PhotoNotFound(error))
+            } else {
+                error
+            }
+        })
+    }
+}
 
 #[derive(Debug)]
 struct SharingId(String);

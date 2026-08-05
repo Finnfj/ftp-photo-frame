@@ -10,9 +10,8 @@ use bytes::Bytes;
 use chrono::Locale;
 
 use crate::{
-    api_client::ApiClient,
+    api_client::{ApiClient, PhotoNotFound},
     cli::{Order, SourceSize},
-    http::{InvalidHttpResponse, StatusCode},
     metadata::Metadata,
     rand::Random,
 };
@@ -152,10 +151,7 @@ pub struct BytesPhoto {
 
 /// Photo has been removed since we fetched its metadata, try next one.
 fn photo_removed(error: &anyhow::Error) -> bool {
-    matches!(
-        error.downcast_ref::<InvalidHttpResponse>(),
-        Some(InvalidHttpResponse(StatusCode::NOT_FOUND))
-    )
+    error.is::<PhotoNotFound>()
 }
 
 /// These tests cover both `slideshow` and `api_client::syno_client` modules
@@ -167,7 +163,7 @@ mod tests {
 
     use crate::{
         api_client::syno_client::SynoApiClient,
-        http::{CookieStore, HttpClient, Jar, MockHttpResponse, Url},
+        http::{CookieStore, HttpClient, Jar, MockHttpResponse, StatusCode, Url},
         test_helpers::rand::FakeRandom,
         test_helpers::{self, MockHttpClient},
     };

@@ -12,7 +12,7 @@ use serde::Deserialize;
 use syno_api::dto::{ApiResponse, List};
 
 use crate::{
-    api_client::{ApiClient, LoginError, SharingId, SortBy},
+    api_client::{ApiClient, LoginError, PhotoNotFoundMapper, SharingId, SortBy},
     cli::SourceSize,
     http::{CookieStore, HttpClient, HttpResponse, InvalidHttpResponse, Query, Url, read_response},
     metadata::{Location, Metadata},
@@ -127,6 +127,7 @@ impl<H: HttpClient, C: CookieStore> ApiClient for SynoApiClient<'_, H, C> {
             let bytes = response.bytes()?;
             Ok(bytes)
         })
+        .map_photo_not_found()
     }
 }
 
