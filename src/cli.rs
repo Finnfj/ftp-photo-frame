@@ -65,6 +65,32 @@ pub struct Cli {
     )]
     pub rotation: Rotation,
 
+    /// BCM number of a GPIO pin a motion sensor is connected to
+    ///
+    /// When set, the display is switched to standby after --motion-sensor-timeout without detected
+    /// motion, and switched back on as soon as motion is detected again. Pin 23 is a common choice.
+    /// Requires a Linux build with the "motion-sensor" feature enabled
+    #[arg(long = "motion-sensor-gpio", value_name = "PIN")]
+    pub motion_sensor_gpio: Option<u8>,
+
+    /// Time without detected motion after which the display is switched to standby, in seconds
+    ///
+    /// Must be greater or equal to 5. Requires --motion-sensor-gpio
+    #[arg(
+        long = "motion-sensor-timeout",
+        value_name = "SECONDS",
+        default_value = "300",
+        value_parser = try_parse_duration)]
+    pub motion_sensor_timeout: Duration,
+
+    /// Command switching the display on and off. Requires --motion-sensor-gpio
+    ///
+    /// The {state} placeholder is replaced with 1 to switch the display on, and with 0 to switch it
+    /// to standby. The command is executed directly rather than through a shell, so anything more
+    /// elaborate has to be wrapped in a script
+    #[arg(long, default_value = DEFAULT_DISPLAY_POWER_COMMAND, value_name = "COMMAND")]
+    pub display_power_command: String,
+
     /// Path to a JPEG file to display during startup, replacing the default splash-screen
     #[arg(long)]
     pub splash: Option<PathBuf>,
@@ -167,6 +193,10 @@ pub enum Background {
     None,
 }
 const ROTATIONS: [&str; 4] = ["0", "90", "180", "270"];
+
+/// Switches the HDMI output of a Raspberry Pi. Other setups need something like `wlr-randr` or
+/// `xset dpms`, which take more than one argument and therefore a wrapper script.
+const DEFAULT_DISPLAY_POWER_COMMAND: &str = "vcgencmd display_power {state}";
 
 /// Screen rotation in degrees
 #[derive(Debug, Copy, Clone)]
