@@ -12,6 +12,7 @@ use syno_photo_frame::{
     http::ClientBuilder,
     logging::LoggingClientDecorator,
     sdl::{self, SdlWrapper},
+    standby::{self, CommandDisplayPower, Standby},
 };
 
 fn main() -> Result<()> {
@@ -40,6 +41,17 @@ fn main() -> Result<()> {
 /// Setup "real" dependencies and run
 fn init_and_run() -> Result<()> {
     let cli = Cli::parse();
+
+    /* Motion sensor. Set up before SDL, so that a missing sensor or an unusable display power
+     * command is reported before the screen is taken over by the slideshow. */
+    let standby = match cli.motion_sensor_gpio {
+        None => Standby::disabled(),
+        Some(gpio_pin) => Standby::new(
+            standby::new_motion_sensor(gpio_pin)?,
+            Box::new(CommandDisplayPower::new(&cli.display_power_command)?),
+            cli.motion_sensor_timeout,
+        ),
+    };
 
     /* HTTP client */
     let cookie_store = Arc::new(reqwest::cookie::Jar::default());
@@ -71,5 +83,6 @@ fn init_and_run() -> Result<()> {
         RandomImpl,
         env!("CARGO_PKG_VERSION"),
         &EnvImpl,
+        standby,
     )
 }

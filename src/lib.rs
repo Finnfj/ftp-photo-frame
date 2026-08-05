@@ -30,6 +30,7 @@ use crate::{
     rand::Random,
     sdl::{Sdl, TextureIndex},
     slideshow::Slideshow,
+    standby::{DisplayState, Standby},
     update::UpdateNotification,
 };
 
@@ -55,6 +56,9 @@ mod update;
 #[cfg(test)]
 mod test_helpers;
 
+/// How long the slideshow loop waits before looking for something to do again
+const LOOP_SLEEP_DURATION: Duration = Duration::from_millis(100);
+
 /// Slideshow loop
 pub fn run<H, R>(
     cli: &Cli,
@@ -63,6 +67,7 @@ pub fn run<H, R>(
     random: R,
     this_crate_version: &str,
     env: &impl Env,
+    standby: Standby,
 ) -> Result<()>
 where
     H: HttpClient + Sync,
@@ -89,6 +94,7 @@ where
             update_check_receiver,
             current_image,
             env,
+            standby,
         )
     })
 }
@@ -112,6 +118,9 @@ fn show_welcome_screen(cli: &Cli, sdl: &mut impl Sdl) -> Result<DynamicImage> {
     Ok(welcome_img)
 }
 
+/* Grouping the arguments into a struct would obscure more than it would help here, as they have
+ * nothing in common besides being needed further down */
+#[allow(clippy::too_many_arguments)]
 fn select_backend_and_start_slideshow<H, R>(
     cli: &Cli,
     (http_client, cookie_store): (&H, &impl CookieStore),
@@ -120,6 +129,7 @@ fn select_backend_and_start_slideshow<H, R>(
     update_check_receiver: Receiver<bool>,
     current_image: DynamicImage,
     env: &impl Env,
+    standby: Standby,
 ) -> Result<()>
 where
     H: HttpClient + Sync,
@@ -140,6 +150,7 @@ where
             update_check_receiver,
             current_image,
             env,
+            standby,
         ),
         Backend::Immich => slideshow_loop(
             cli,
@@ -149,11 +160,13 @@ where
             update_check_receiver,
             current_image,
             env,
+            standby,
         ),
         Backend::Auto => unreachable!(),
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn slideshow_loop<A, R>(
     cli: &Cli,
     api_client: A,
@@ -162,6 +175,7 @@ fn slideshow_loop<A, R>(
     update_check_receiver: Receiver<bool>,
     mut current_image: DynamicImage,
     env: &impl Env,
+    mut standby: Standby,
 ) -> Result<()>
 where
     A: ApiClient + Send,
@@ -172,7 +186,6 @@ where
     let screen_size = sdl.size();
     let mut update_notification = UpdateNotification::new(screen_size, cli.rotation)?;
     let (photo_sender, photo_receiver) = mpsc::sync_channel(1);
-    const LOOP_SLEEP_DURATION: Duration = Duration::from_millis(100);
 
     thread::scope::<'_, _, Result<()>>(|thread_scope| {
         photo_fetcher_thread(
@@ -187,6 +200,15 @@ where
 
         let loop_result = loop {
             sdl.handle_quit_event()?;
+
+            if standby.update() == DisplayState::Asleep {
+                /* Nobody is watching, so the slideshow pauses along with the display. The photo
+                 * fetching thread blocks on its own once it has filled the channel. last_change is
+                 * deliberately left alone: by the time somebody shows up again its interval has
+                 * long passed, so a fresh photo appears immediately. */
+                thread_sleep(LOOP_SLEEP_DURATION);
+                continue;
+            }
 
             if let Ok(true) = update_check_receiver.try_recv() {
                 /* Overlay a notification on the currently displayed image when an update was
@@ -344,6 +366,13 @@ mod tests {
     use mock_instant::thread_local::MockClock;
     use syno_api::dto::{ApiResponse, Error, List};
 
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    use mockall::{Sequence, predicate::eq};
+
     use super::*;
     use crate::{
         api_client::syno_client::Login,
@@ -351,8 +380,13 @@ mod tests {
         env::MockEnv,
         http::{Jar, MockHttpResponse, StatusCode},
         sdl::MockSdl,
+        standby::{MockDisplayPower, MockMotionSensor, PowerState},
         test_helpers::{MockHttpClient, rand::FakeRandom},
     };
+
+    /// Where the fake clock starts, chosen so that subtracting the display interval from it when
+    /// setting the initial last_change does not underflow
+    const START_TIME: Duration = Duration::from_secs(30);
 
     #[test]
     fn when_login_fails_with_api_error_then_loop_terminates() {
@@ -403,6 +437,7 @@ mod tests {
             FakeRandom::default(),
             "1.2.3",
             &MockEnv::default(),
+            Standby::disabled(),
         );
 
         assert!(result.is_err_and(|e| e.is::<LoginError>()));
@@ -442,6 +477,7 @@ mod tests {
             FakeRandom::default(),
             "1.2.3",
             &MockEnv::default(),
+            Standby::disabled(),
         );
 
         assert!(result.is_err_and(|e| e.is::<LoginError>()));
@@ -536,6 +572,7 @@ mod tests {
             FakeRandom::default(),
             "1.2.3",
             &MockEnv::default().with_default_expectations(),
+            Standby::disabled(),
         );
 
         /* If failed request bubbled up its error and broke the main slideshow loop, we would
@@ -633,12 +670,204 @@ mod tests {
             FakeRandom::default(),
             "1.2.3",
             &MockEnv::default().with_default_expectations(),
+            Standby::disabled(),
         );
 
         /* If failed request bubbled up its error and broke the main slideshow loop, we would
          * observe it here as the error type would be different from Quit */
         assert!(result.is_err_and(|e| e.is::<QuitEvent>()));
         client_stub.checkpoint();
+    }
+
+    /// Standby has to pause the slideshow rather than let it run against a switched off display,
+    /// and must leave the display switched on when the application exits
+    #[test]
+    fn when_no_motion_is_detected_then_the_slideshow_pauses_and_the_display_is_restored_on_exit() {
+        const STANDBY_TIMEOUT: Duration = Duration::from_secs(5);
+        let mut sequence = Sequence::new();
+        let mut display_power = MockDisplayPower::new();
+        display_power
+            .expect_set()
+            .with(eq(PowerState::Standby))
+            .times(1)
+            .in_sequence(&mut sequence)
+            .returning(|_| Ok(()));
+        display_power
+            .expect_set()
+            .with(eq(PowerState::On))
+            .times(1)
+            .in_sequence(&mut sequence)
+            .returning(|_| Ok(()));
+
+        let mut sdl_stub = MockSdl::new().with_default_expectations();
+        let displayed_at = record_displayed_photos(&mut sdl_stub);
+        let photos = Arc::clone(&displayed_at);
+        let end = START_TIME + Duration::from_secs(60);
+        sdl_stub.expect_handle_quit_event().returning(move || {
+            match photos.lock().unwrap().len() {
+                /* Fetching the first photo takes an unpredictable number of iterations, so the
+                 * clock is held still until it is on screen */
+                0 => (),
+                _ if MockClock::time() >= end => return Err(QuitEvent),
+                _ => MockClock::advance(LOOP_SLEEP_DURATION),
+            }
+            std::thread::yield_now();
+            Ok(())
+        });
+
+        let result = run_with_standby(&mut sdl_stub, || {
+            Standby::new(
+                motion_sensor(|| Ok(false)),
+                Box::new(display_power),
+                STANDBY_TIMEOUT,
+            )
+        });
+
+        assert!(result.is_err_and(|e| e.is::<QuitEvent>()));
+        /* Without the pause, the display interval would have fitted two more photos into the minute
+         * this test covers */
+        let displayed_at = displayed_at.lock().unwrap();
+        assert!(
+            displayed_at
+                .iter()
+                .all(|at| *at < START_TIME + STANDBY_TIMEOUT * 2),
+            "no photo may be displayed once the display is off, was {displayed_at:?}"
+        );
+    }
+
+    #[test]
+    fn when_motion_is_detected_then_the_slideshow_resumes() {
+        const STANDBY_TIMEOUT: Duration = Duration::from_secs(5);
+        /* Somebody walks in well after the display went to standby */
+        const MOTION_AT: Duration = Duration::from_secs(60);
+        let mut sequence = Sequence::new();
+        let mut display_power = MockDisplayPower::new();
+        display_power
+            .expect_set()
+            .with(eq(PowerState::Standby))
+            .times(1)
+            .in_sequence(&mut sequence)
+            .returning(|_| Ok(()));
+        /* Exactly once, and not again when dropped, because the frame ends up awake */
+        let woke_up = Arc::new(AtomicBool::new(false));
+        let switched_on = Arc::clone(&woke_up);
+        display_power
+            .expect_set()
+            .with(eq(PowerState::On))
+            .times(1)
+            .in_sequence(&mut sequence)
+            .returning(move |_| {
+                switched_on.store(true, Ordering::SeqCst);
+                Ok(())
+            });
+
+        let mut sdl_stub = MockSdl::new().with_default_expectations();
+        let displayed_at = record_displayed_photos(&mut sdl_stub);
+        let photos = Arc::clone(&displayed_at);
+        sdl_stub.expect_handle_quit_event().returning(move || {
+            let displayed = photos.lock().unwrap().len();
+            if displayed == 0 {
+                /* Fetching a photo takes an unpredictable number of iterations, so the clock is
+                 * held still while the test waits for one */
+            } else if !woke_up.load(Ordering::SeqCst) {
+                /* Let time pass, so that the display first goes to standby and the motion reported
+                 * afterwards gets a chance to be confirmed */
+                MockClock::advance(LOOP_SLEEP_DURATION);
+            } else if displayed >= 2 {
+                return Err(QuitEvent);
+            }
+            std::thread::yield_now();
+            Ok(())
+        });
+
+        let result = run_with_standby(&mut sdl_stub, || {
+            Standby::new(
+                motion_sensor(|| Ok(MockClock::time() > MOTION_AT)),
+                Box::new(display_power),
+                STANDBY_TIMEOUT,
+            )
+        });
+
+        assert!(result.is_err_and(|e| e.is::<QuitEvent>()));
+        let displayed_at = displayed_at.lock().unwrap();
+        assert!(
+            displayed_at.iter().any(|at| *at > MOTION_AT),
+            "a photo must be displayed again after waking up, was {displayed_at:?}"
+        );
+    }
+
+    /// Runs the slideshow against a Synology backend that always has photos to offer, so that the
+    /// test only observes what standby does to the pacing
+    fn run_with_standby(sdl: &mut MockSdl, standby: impl FnOnce() -> Standby) -> Result<()> {
+        const SHARE_LINK: &str = "http://fake.dsm.addr/aa/sharing/FakeSharingId";
+        const DISPLAY_INTERVAL: u64 = 30;
+        debug_assert_eq!(START_TIME, Duration::from_secs(DISPLAY_INTERVAL));
+
+        let mut client_stub = MockHttpClient::new();
+        client_stub
+            .expect_post()
+            .withf(|_, form, _, _| test_helpers::is_login_form(form, "FakeSharingId"))
+            .return_once(|_, _, _, _| Ok(test_helpers::new_success_response_with_json(Login {})));
+        client_stub
+            .expect_post()
+            .withf(|_, form, _, _| test_helpers::is_list_form(form))
+            .returning(|_, _, _, _| {
+                Ok(test_helpers::new_success_response_with_json(List {
+                    list: vec![
+                        test_helpers::new_photo_dto(1, "photo1"),
+                        test_helpers::new_photo_dto(2, "photo2"),
+                    ],
+                }))
+            });
+        client_stub.expect_get().returning(|_, _| {
+            let mut response = test_helpers::new_ok_response();
+            response.expect_bytes().return_once(|| {
+                Ok(Bytes::from_static(include_bytes!(
+                    "../assets/test_loading.jpeg"
+                )))
+            });
+            Ok(response)
+        });
+
+        /* Avoid overflow when setting the initial last_change, and only build the standby afterward
+         * so that it starts counting from the same point in time */
+        MockClock::set_time(START_TIME);
+        let cli_command = format!(
+            "syno-photo-frame {SHARE_LINK}              --interval {DISPLAY_INTERVAL}              --disable-update-check              --transition none              --splash assets/test_loading.jpeg"
+        );
+
+        run(
+            &Cli::parse_from(cli_command.split_whitespace()),
+            (&client_stub, &Jar::default()),
+            sdl,
+            FakeRandom::default(),
+            "1.2.3",
+            &MockEnv::default().with_default_expectations(),
+            standby(),
+        )
+    }
+
+    /// Records when each photo was put on screen, which is what the pacing assertions look at
+    fn record_displayed_photos(sdl: &mut MockSdl) -> Arc<Mutex<Vec<Duration>>> {
+        /* Needed by the transition, which these tests reach unlike those that fail at login */
+        sdl.expect_clear_canvas().return_const(());
+        let displayed_at = Arc::new(Mutex::new(vec![]));
+        let recorder = Arc::clone(&displayed_at);
+        sdl.expect_swap_textures().returning(move || {
+            recorder.lock().unwrap().push(MockClock::time());
+        });
+        displayed_at
+    }
+
+    fn motion_sensor(
+        is_motion_detected: impl Fn() -> Result<bool> + Send + 'static,
+    ) -> Box<dyn crate::standby::MotionSensor> {
+        let mut sensor = MockMotionSensor::new();
+        sensor.expect_is_motion_detected().returning(move || {
+            let is_motion_detected = &is_motion_detected;
+            is_motion_detected()
+        });
+        Box::new(sensor)
     }
 
     impl MockSdl {
