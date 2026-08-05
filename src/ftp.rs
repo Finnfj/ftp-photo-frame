@@ -363,7 +363,8 @@ pub const fn check_tls_supported(_: &FtpAddress) -> Result<()> {
 pub fn check_tls_supported(address: &FtpAddress) -> Result<()> {
     if address.tls {
         bail!(
-            "ftps:// links require a build with FTPS support. Reinstall with              `cargo install syno-photo-frame --features ftps`, or use an ftp:// link instead."
+            "ftps:// links require a build with FTPS support. Reinstall with \
+             `cargo install syno-photo-frame --features ftps`, or use an ftp:// link instead."
         )
     }
     Ok(())
