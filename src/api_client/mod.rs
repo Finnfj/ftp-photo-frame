@@ -119,7 +119,7 @@ impl fmt::Display for SortBy {
 
 pub fn detect_backend(share_link: &Url) -> Result<Backend> {
     /* Checked before the patterns below, as the scheme is unambiguous */
-    if share_link.scheme() == "ftp" {
+    if matches!(share_link.scheme(), "ftp" | "ftps") {
         return Ok(Backend::Ftp);
     }
 
@@ -189,6 +189,7 @@ mod tests {
             "ftp://fake.nas/Photos",
             "ftp://joe@fake.nas:2121/Photos/summer",
             "ftp://fake.nas",
+            "ftps://fake.nas/Photos",
         ] {
             let result = detect_backend(&Url::parse(share_link).unwrap());
 

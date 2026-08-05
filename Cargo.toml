@@ -25,6 +25,11 @@ exclude = [
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[features]
+default = []
+# FTPS support for the FTP backend, i.e. ftps:// share links
+ftps = ["dep:rustls", "dep:rustls-platform-verifier", "suppaftp/rustls-aws-lc-rs"]
+
 [dependencies]
 anyhow = "1.*"
 bytes = "1.*"
@@ -35,6 +40,8 @@ log = "0.4.*"
 rand = "0.10.*"
 regex = "1.*"
 reqwest = { version = "0.13.*", features = ["blocking", "cookies", "json", "form", "query"] }
+rustls = { version = "0.23.*", optional = true, features = ["aws-lc-rs"] }
+rustls-platform-verifier = { version = "0.7.*", optional = true }
 sdl2 = { version = "0.38.*", features = ["gfx", "ttf"] }
 serde = { version = "1.*", features = ["derive"] }
 serde_json = "1.*"

@@ -20,7 +20,8 @@ pub struct Cli {
     pub backend: Backend,
 
     /// Link to a publicly shared album on Synology Photos or Immich, or an ftp://user@host/path
-    /// link to a directory of photos on an FTP server
+    /// link to a directory of photos on an FTP server (ftps:// requires a build with the "ftps"
+    /// feature)
     ///
     /// Note that the album's privacy settings must be set to Public. For an FTP link, the user name
     /// is taken from the link, and an anonymous login is used when it is omitted

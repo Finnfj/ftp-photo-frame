@@ -9,9 +9,14 @@ use std::{
 use anyhow::{Result, anyhow, bail};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use suppaftp::{
-    FtpError, FtpStream, Mode, Status, list::ListParser, types::FileType as TransferType,
-};
+use suppaftp::{FtpError, Mode, Status, list::ListParser, types::FileType as TransferType};
+
+/// FTPS is optional, and [suppaftp::RustlsFtpStream] communicates in plain text until it is told to
+/// negotiate TLS, so one stream type covers both cases
+#[cfg(not(feature = "ftps"))]
+type Stream = suppaftp::FtpStream;
+#[cfg(feature = "ftps")]
+type Stream = suppaftp::RustlsFtpStream;
 
 /// Isolates the FTP protocol for testing, mirroring the role of [crate::http::HttpClient].
 ///
@@ -62,6 +67,9 @@ pub enum EntryKind {
 pub struct FtpAddress {
     pub host: String,
     pub port: u16,
+    /// Whether the session is secured with TLS, as requested by an `ftps://` share link. Explicit
+    /// FTPS, i.e. `AUTH TLS` on the regular port, rather than implicit FTPS on port 990.
+    pub tls: bool,
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -126,7 +134,7 @@ enum Listing {
 /// Isolates [suppaftp]
 pub struct SuppaFtpTransport {
     timeout: Duration,
-    stream: Option<FtpStream>,
+    stream: Option<Stream>,
     /// Negotiated on first use and remembered, so that a server without `MLSD` support is not
     /// probed again for every directory
     listing: Option<Listing>,
@@ -141,7 +149,7 @@ impl SuppaFtpTransport {
         }
     }
 
-    fn stream_mut(&mut self) -> Result<&mut FtpStream> {
+    fn stream_mut(&mut self) -> Result<&mut Stream> {
         self.stream.as_mut().ok_or_else(|| {
             /* Reported as a lost connection so that a caller which retries recovers by reconnecting
              * instead of failing outright */
@@ -154,14 +162,14 @@ impl FtpTransport for SuppaFtpTransport {
     fn connect(&mut self, address: &FtpAddress, credentials: &Credentials) -> Result<()> {
         self.disconnect();
 
-        let FtpAddress { host, port } = address;
+        let FtpAddress { host, port, .. } = address;
         let socket_address = (host.as_str(), *port)
             .to_socket_addrs()?
             .next()
             .ok_or_else(|| anyhow!("Cannot resolve FTP server address {host}:{port}"))?;
         log::info!("Connecting to FTP server {host}:{port}");
         let mut stream =
-            FtpStream::connect_timeout(socket_address, self.timeout).map_err(map_error)?;
+            Stream::connect_timeout(socket_address, self.timeout).map_err(map_error)?;
         /* FTP itself defines no timeouts, so without these a server that stops responding would
          * block the photo fetching thread indefinitely */
         let socket = stream.get_ref();
@@ -170,6 +178,14 @@ impl FtpTransport for SuppaFtpTransport {
         /* Stated explicitly although it is the default: a photo frame is behind NAT, and active
          * mode would require the server to connect back to it */
         stream.set_mode(Mode::Passive);
+        #[cfg(feature = "ftps")]
+        if address.tls {
+            /* Secured before logging in, so that the credentials are never sent in plain text */
+            log::info!("Securing the FTP connection with TLS");
+            stream = stream
+                .into_secure(tls_connector()?, host)
+                .map_err(map_error)?;
+        }
         stream
             .login(&credentials.user, &credentials.password)
             .map_err(map_error)?;
@@ -317,6 +333,40 @@ fn map_error(error: FtpError) -> anyhow::Error {
         Kind::InvalidResponse(status, message) => anyhow!(InvalidFtpResponse { status, message }),
         Kind::Other => anyhow!(error),
     }
+}
+
+/// Builds a TLS configuration that trusts the same certificates as an HTTPS share link does, so
+/// that a self-signed server certificate has to be installed in the system's trust store
+#[cfg(feature = "ftps")]
+fn tls_connector() -> Result<suppaftp::RustlsConnector> {
+    use rustls_platform_verifier::BuilderVerifierExt;
+    use std::sync::Arc;
+
+    /* The provider is named explicitly rather than taken from the process default, which would be
+     * ambiguous if a second one were ever enabled on the shared rustls dependency */
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()?
+        .with_platform_verifier()?
+        .with_no_client_auth();
+    Ok(suppaftp::RustlsConnector::from(Arc::new(config)))
+}
+
+/// Fails when an `ftps://` link is used by a build without FTPS support, before anything is
+/// displayed, rather than letting it fail as a confusing connection error later
+#[cfg(feature = "ftps")]
+pub const fn check_tls_supported(_: &FtpAddress) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(feature = "ftps"))]
+pub fn check_tls_supported(address: &FtpAddress) -> Result<()> {
+    if address.tls {
+        bail!(
+            "ftps:// links require a build with FTPS support. Reinstall with              `cargo install syno-photo-frame --features ftps`, or use an ftp:// link instead."
+        )
+    }
+    Ok(())
 }
 
 /// Fails when a path cannot be used in an FTP command

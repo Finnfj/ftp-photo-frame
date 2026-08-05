@@ -10,7 +10,7 @@ use crate::{
     cli::SourceSize,
     ftp::{
         ConnectionLost, Credentials, EntryKind, FtpAddress, FtpTransport, InvalidFtpResponse,
-        validate_path,
+        check_tls_supported, validate_path,
     },
     http::Url,
     metadata::{Location, Metadata},
@@ -31,6 +31,10 @@ const MAX_DEPTH: usize = 16;
 const MAX_ATTEMPTS: usize = 2;
 
 const ANONYMOUS_USER: &str = "anonymous";
+
+/// Both `ftp://` and `ftps://` use the FTP control port, as FTPS is negotiated on an ordinary
+/// connection with `AUTH TLS`
+const DEFAULT_PORT: u16 = 21;
 
 /// Reads photos from a directory on an FTP server
 pub struct FtpApiClient<T> {
@@ -54,6 +58,7 @@ pub struct FtpApiClient<T> {
 impl<T: FtpTransport> FtpApiClient<T> {
     pub fn build(transport: T, share_link: &Url) -> Result<Self> {
         let (address, credentials, root) = parse_share_link(share_link)?;
+        check_tls_supported(&address)?;
         Ok(Self {
             address,
             credentials,
@@ -337,17 +342,18 @@ fn join(directory: &str, name: &str) -> String {
 /// Extracts the server address, the credentials and the root directory from an `ftp://` link
 fn parse_share_link(share_link: &Url) -> Result<(FtpAddress, Credentials, String)> {
     /* The link is never quoted in an error message, since it may contain a password */
-    if share_link.scheme() != "ftp" {
-        bail!("Invalid FTP share link: expected an ftp:// URL");
-    }
+    let tls = match share_link.scheme() {
+        "ftp" => false,
+        "ftps" => true,
+        _ => bail!("Invalid FTP share link: expected an ftp:// or ftps:// URL"),
+    };
     let host = share_link
         .host_str()
         .context("Invalid FTP share link: no host name")?
         .to_string();
-    /* "ftp" is a special scheme in the URL standard, so its default port is known */
-    let port = share_link
-        .port_or_known_default()
-        .context("Invalid FTP share link: no port")?;
+    /* Only "ftp" is a special scheme in the URL standard, so only its default port is known.
+     * "ftps" uses the same port, as FTPS is negotiated on an ordinary FTP connection. */
+    let port = share_link.port().unwrap_or(DEFAULT_PORT);
 
     let user = decode(share_link.username())?;
     let user = if user.is_empty() {
@@ -372,7 +378,7 @@ fn parse_share_link(share_link: &Url) -> Result<(FtpAddress, Credentials, String
     validate_path(&root)?;
 
     Ok((
-        FtpAddress { host, port },
+        FtpAddress { host, port, tls },
         Credentials { user, password },
         root,
     ))
@@ -465,12 +471,32 @@ mod tests {
     }
 
     #[test]
+    fn parse_share_link_reads_the_scheme_as_a_request_for_tls() {
+        fn test_case(share_link: &str, expected_tls: bool, expected_port: u16) {
+            let (address, ..) = parse_share_link(&Url::parse(share_link).unwrap()).unwrap();
+
+            assert_eq!(address.tls, expected_tls, "link was {share_link}");
+            /* "ftps" is not a special scheme, so its default port is not known to Url */
+            assert_eq!(address.port, expected_port, "link was {share_link}");
+        }
+
+        test_case("ftp://fake.nas/Photos", false, 21);
+        test_case("ftps://fake.nas/Photos", true, 21);
+        test_case("ftps://fake.nas:2121/Photos", true, 2121);
+    }
+
+    #[test]
+    fn parse_share_link_handles_an_ftps_link_without_a_path() {
+        let share_link = Url::parse("ftps://fake.nas").unwrap();
+
+        let (_, _, root) = parse_share_link(&share_link).unwrap();
+
+        assert_eq!(root, "/");
+    }
+
+    #[test]
     fn parse_share_link_rejects_a_non_ftp_link() {
-        for share_link in [
-            "https://fake.nas/Photos",
-            "ftps://fake.nas/Photos",
-            "file:///Photos",
-        ] {
+        for share_link in ["https://fake.nas/Photos", "file:///Photos"] {
             let result = parse_share_link(&Url::parse(share_link).unwrap());
 
             assert!(result.is_err(), "link was {share_link}");
@@ -858,6 +884,7 @@ mod tests {
                     == &(FtpAddress {
                         host: "fake.nas".to_string(),
                         port: 2121,
+                        tls: false,
                     })
                     && credentials.user == "joe"
                     && credentials.password == "secret"
@@ -1015,6 +1042,27 @@ mod tests {
             date,
             Some(Utc.with_ymd_and_hms(2019, 7, 14, 9, 12, 45).unwrap())
         );
+    }
+
+    #[test]
+    #[cfg(not(feature = "ftps"))]
+    fn build_reports_an_ftps_link_as_unsupported_by_this_build() {
+        let share_link = Url::parse("ftps://fake.nas/Photos").unwrap();
+
+        let result = FtpApiClient::build(MockFtpTransport::new(), &share_link);
+
+        let error = result.err().expect("should be rejected");
+        let message = format!("{error:#}");
+        assert!(message.contains("ftps"), "was {message}");
+        assert!(message.contains("--features ftps"), "was {message}");
+    }
+
+    #[test]
+    #[cfg(feature = "ftps")]
+    fn build_accepts_an_ftps_link() {
+        let share_link = Url::parse("ftps://fake.nas/Photos").unwrap();
+
+        assert!(FtpApiClient::build(MockFtpTransport::new(), &share_link).is_ok());
     }
 
     fn new_client<T: FtpTransport>(transport: T, share_link: &str) -> FtpApiClient<T> {
