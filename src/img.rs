@@ -46,13 +46,16 @@ impl Framed for DynamicImage {
         rotate: Rotation,
         background: Background,
     ) -> Self {
-        internal_fit_to_screen_and_add_background(
+        let start = std::time::Instant::now();
+        let result = internal_fit_to_screen_and_add_background(
             self,
             screen_size,
             rotate,
             background,
             brighten_and_blur_background,
-        )
+        );
+        log::debug!("Fitting photo to screen took {:?}", start.elapsed());
+        result
     }
 
     fn overlay_update_icon(&mut self, update_icon: &Self, rotation: Rotation) {
