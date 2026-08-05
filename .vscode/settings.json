@@ -1,0 +1,5 @@
+{
+    // Deliberately no "rust-analyzer.cargo.target": analysing for aarch64 would hide the warnings
+    // and test failures of the host build
+    "rust-analyzer.check.command": "clippy"
+}
