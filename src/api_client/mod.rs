@@ -10,6 +10,7 @@ use crate::{
     metadata::Metadata,
 };
 
+pub mod ftp_client;
 pub mod immich_client;
 pub mod syno_client;
 
@@ -117,6 +118,11 @@ impl fmt::Display for SortBy {
 }
 
 pub fn detect_backend(share_link: &Url) -> Result<Backend> {
+    /* Checked before the patterns below, as the scheme is unambiguous */
+    if share_link.scheme() == "ftp" {
+        return Ok(Backend::Ftp);
+    }
+
     static SYNO_LINK_RE: OnceLock<Regex> = OnceLock::new();
     let syno_link_re = SYNO_LINK_RE
         .get_or_init(|| Regex::new(r"^https?://.+/[[:word:]]{2}/sharing/[^/]+/?$").unwrap());
@@ -175,6 +181,22 @@ mod tests {
         let result = detect_backend(&Url::parse(SHARE_LINK).unwrap());
 
         assert!(matches!(result, Ok(Backend::Immich)));
+    }
+
+    #[test]
+    fn when_ftp_share_link_then_detect_backend_returns_ftp() {
+        for share_link in [
+            "ftp://fake.nas/Photos",
+            "ftp://joe@fake.nas:2121/Photos/summer",
+            "ftp://fake.nas",
+        ] {
+            let result = detect_backend(&Url::parse(share_link).unwrap());
+
+            assert!(
+                matches!(result, Ok(Backend::Ftp)),
+                "link was {share_link}, result was {result:?}"
+            );
+        }
     }
 
     #[test]
