@@ -3,6 +3,7 @@ pub use image::{DynamicImage, open};
 use std::thread::{self, JoinHandle};
 
 use anyhow::Result;
+use fast_image_resize::{FilterType as FirFilterType, ResizeAlg, ResizeOptions, Resizer};
 use image::{
     self, GenericImageView,
     imageops::{self, FilterType},
@@ -45,13 +46,16 @@ impl Framed for DynamicImage {
         rotate: Rotation,
         background: Background,
     ) -> Self {
-        internal_fit_to_screen_and_add_background(
+        let start = std::time::Instant::now();
+        let result = internal_fit_to_screen_and_add_background(
             self,
             screen_size,
             rotate,
             background,
             brighten_and_blur_background,
-        )
+        );
+        log::debug!("Fitting photo to screen took {:?}", start.elapsed());
+        result
     }
 
     fn overlay_update_icon(&mut self, update_icon: &Self, rotation: Rotation) {
@@ -66,7 +70,12 @@ impl Framed for DynamicImage {
     }
 
     fn resize(&self, new_width: u32, new_height: u32) -> Self {
-        self.resize(new_width, new_height, FilterType::Lanczos3)
+        resize_preserving_aspect(
+            self,
+            (new_width, new_height),
+            ResizeAlg::Convolution(FirFilterType::Lanczos3),
+            FilterType::Lanczos3,
+        )
     }
 
     fn rotate(&self, degrees: Rotation) -> Self {
@@ -139,7 +148,12 @@ fn resize_to_fit_screen(original: &DynamicImage, (x_res, y_res): (u32, u32)) -> 
         /* Image fits perfectly, background not needed. Note that this may still stretch the image
          * by one pixel horizontally or vertically to make a perfect fit when resized dimensions
          * are off by a fraction. */
-        return original.resize_exact(x_res, y_res, FilterType::Lanczos3);
+        return resize_exact_with(
+            original,
+            (x_res, y_res),
+            ResizeAlg::Convolution(FirFilterType::Lanczos3),
+            FilterType::Lanczos3,
+        );
     }
 
     Framed::resize(original, x_res, y_res)
@@ -199,14 +213,72 @@ fn background_fill_threads(
         ),
     );
     let bg_thread1 = thread::spawn(move || {
-        let bg = bg_crop1.resize(x_res, y_res, FilterType::Nearest);
+        let bg = resize_preserving_aspect(
+            &bg_crop1,
+            (x_res, y_res),
+            ResizeAlg::Nearest,
+            FilterType::Nearest,
+        );
         brighten_and_blur(&bg)
     });
     let bg_thread2 = thread::spawn(move || {
-        let bg = bg_crop2.resize(x_res, y_res, FilterType::Nearest);
+        let bg = resize_preserving_aspect(
+            &bg_crop2,
+            (x_res, y_res),
+            ResizeAlg::Nearest,
+            FilterType::Nearest,
+        );
         brighten_and_blur(&bg)
     });
     (bg_thread1, bg_thread2)
+}
+
+/// Resizes an image to the largest size fitting within `bounds`, preserving the aspect ratio.
+///
+/// Equivalent to [image::DynamicImage::resize], except that the target size is computed here
+/// instead of inside the `image` crate, so that the resize implementation can be replaced without
+/// affecting the resulting dimensions.
+fn resize_preserving_aspect(
+    original: &DynamicImage,
+    bounds: (u32, u32),
+    algorithm: ResizeAlg,
+    fallback: FilterType,
+) -> DynamicImage {
+    if original.dimensions() == bounds {
+        return original.clone();
+    }
+
+    let target = Dimensions::from(original.dimensions())
+        .resize(Dimensions::from(bounds))
+        .to_rounded();
+    resize_exact_with(original, target, algorithm, fallback)
+}
+
+/// Resizes an image to exactly `(new_width, new_height)`, disregarding the aspect ratio.
+///
+/// Uses [fast_image_resize], which is considerably faster than `image`'s implementation on the
+/// low-powered hardware this application typically runs on. `fallback` selects the `image` filter
+/// used in the unlikely case that the pixel format is not supported by [fast_image_resize] - all
+/// [DynamicImage] variants currently are.
+fn resize_exact_with(
+    original: &DynamicImage,
+    (new_width, new_height): (u32, u32),
+    algorithm: ResizeAlg,
+    fallback: FilterType,
+) -> DynamicImage {
+    /* The destination must have the same pixel type as the source. */
+    let mut resized = DynamicImage::new(new_width, new_height, original.color());
+    /* Alpha is premultiplied around the resize (fast_image_resize does this by default). The only
+     * image with an alpha channel here is the update icon, which gets composited onto a photo
+     * afterwards, so premultiplying is the correct thing to do. */
+    let options = ResizeOptions::new().resize_alg(algorithm);
+    match Resizer::new().resize(original, &mut resized, &options) {
+        Ok(()) => resized,
+        Err(error) => {
+            log::warn!("Fast resize failed ({error}), falling back to image's implementation");
+            original.resize_exact(new_width, new_height, fallback)
+        }
+    }
 }
 
 fn brighten_and_blur_background(background: &DynamicImage) -> DynamicImage {
@@ -237,6 +309,18 @@ impl Dimensions {
 
     const fn diff(self, Dimensions { w, h }: Dimensions) -> (f64, f64) {
         (f64::abs(self.w - w), f64::abs(self.h - h))
+    }
+
+    /// Rounds to integer dimensions the same way `image`'s internal `resize_dimensions` does, so
+    /// that replacing the resize implementation cannot change the result by a pixel.
+    ///
+    /// Not a `const fn`, unlike its neighbours: [f64::round] is not const-stable in this crate's
+    /// minimum supported Rust version.
+    fn to_rounded(self) -> (u32, u32) {
+        (
+            u32::max(self.w.round() as u32, 1),
+            u32::max(self.h.round() as u32, 1),
+        )
     }
 
     const fn is_exact_fit_to(self, target: Dimensions) -> bool {
@@ -549,6 +633,37 @@ mod tests {
                 assert_eq!(result.get_pixel(x, y), Rgba([0, 0, 200, 255]))
             }
         }
+    }
+
+    /// Not an assertion, but a way to confirm that replacing the resize implementation is actually
+    /// worth it on a given machine. Run with
+    /// `cargo test --release -- --ignored --nocapture compare_resize_implementations`.
+    #[test]
+    #[ignore = "prints a measurement instead of asserting"]
+    fn compare_resize_implementations() {
+        let original = create_test_image((4000, 3000), RED);
+        let (bound_w, bound_h) = (1920, 1080);
+
+        let start = std::time::Instant::now();
+        let fast = resize_preserving_aspect(
+            &original,
+            (bound_w, bound_h),
+            ResizeAlg::Convolution(FirFilterType::Lanczos3),
+            FilterType::Lanczos3,
+        );
+        let fast_duration = start.elapsed();
+
+        let start = std::time::Instant::now();
+        let reference = original.resize(bound_w, bound_h, FilterType::Lanczos3);
+        let reference_duration = start.elapsed();
+
+        /* Both implementations must at least agree on the result size */
+        assert_eq!(fast.dimensions(), reference.dimensions());
+        println!(
+            "4000x3000 -> {}x{}: fast_image_resize {fast_duration:?}, image {reference_duration:?}",
+            fast.width(),
+            fast.height()
+        );
     }
 
     fn create_test_image((w, h): (u32, u32), pixel: Rgba<u8>) -> DynamicImage {

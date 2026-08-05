@@ -30,6 +30,7 @@ anyhow = "1.*"
 bytes = "1.*"
 clap = { version = "4.*", features = ["derive", "wrap_help"] }
 chrono = { version = "0.4.*", features = ["serde", "unstable-locales"] }
+fast_image_resize = { version = "5.*", features = ["image"] }
 image = { version = "0.25.*", default-features = false, features = ["jpeg", "png"] }
 log = "0.4.*"
 rand = "0.10.*"
