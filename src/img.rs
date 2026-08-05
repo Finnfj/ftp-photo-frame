@@ -632,6 +632,37 @@ mod tests {
         }
     }
 
+    /// Not an assertion, but a way to confirm that replacing the resize implementation is actually
+    /// worth it on a given machine. Run with
+    /// `cargo test --release -- --ignored --nocapture compare_resize_implementations`.
+    #[test]
+    #[ignore = "prints a measurement instead of asserting"]
+    fn compare_resize_implementations() {
+        let original = create_test_image((4000, 3000), RED);
+        let (bound_w, bound_h) = (1920, 1080);
+
+        let start = std::time::Instant::now();
+        let fast = resize_preserving_aspect(
+            &original,
+            (bound_w, bound_h),
+            ResizeAlg::Convolution(FirFilterType::Lanczos3),
+            FilterType::Lanczos3,
+        );
+        let fast_duration = start.elapsed();
+
+        let start = std::time::Instant::now();
+        let reference = original.resize(bound_w, bound_h, FilterType::Lanczos3);
+        let reference_duration = start.elapsed();
+
+        /* Both implementations must at least agree on the result size */
+        assert_eq!(fast.dimensions(), reference.dimensions());
+        println!(
+            "4000x3000 -> {}x{}: fast_image_resize {fast_duration:?}, image {reference_duration:?}",
+            fast.width(),
+            fast.height()
+        );
+    }
+
     fn create_test_image((w, h): (u32, u32), pixel: Rgba<u8>) -> DynamicImage {
         let mut image = DynamicImage::new_rgb8(w, h);
         for y in 0..h {
