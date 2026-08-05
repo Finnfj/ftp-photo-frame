@@ -35,6 +35,7 @@ __If you like the project, give it a star ⭐, or consider becoming a__
     - [Auto-start](#auto-start)
     - [Startup-Shutdown Schedule](#startup-shutdown-schedule)
     - [Auto Brightness](#auto-brightness)
+    - [Motion Sensor](#motion-sensor)
     - [Start from a Random Photo and in Random Order](#start-from-a-random-photo-and-in-random-order)
     - [Change the Transition Effect](#change-the-transition-effect)
     - [Display Shooting Date and Location](#display-shooting-date-and-location)
@@ -186,6 +187,14 @@ cargo build --release
 
 The binary is then located at `target/release/syno-photo-frame`.
 
+To use a [Motion Sensor](#motion-sensor), enable the `motion-sensor`
+feature. It is optional because it is only useful on a Raspberry Pi
+with a sensor attached:
+
+```bash
+cargo install syno-photo-frame --features motion-sensor
+```
+
 ##### Alternative: Build With Docker
 
 If you don't want to install Rust or the build dependencies for some
@@ -259,6 +268,59 @@ example of such sensor. Check out my
 [auto-brightness-rpi-tsl2591](https://github.com/Caleb9/auto-brightness-rpi-tsl2591)
 project to add automatic brightness control to your digital photo
 frame.
+
+### Motion Sensor
+
+A motion sensor attached to a GPIO pin can switch the display off while
+nobody is in the room, and back on as soon as somebody shows up. This
+saves power and spares the panel, and complements the
+[Startup-Shutdown Schedule](#startup-shutdown-schedule) for periods
+when the frame is supposed to be running but nobody is watching.
+
+The [HC-SR501](https://www.adafruit.com/product/189) is a common,
+inexpensive choice. Connect its VCC to a 5V pin, GND to a ground pin,
+and its output to a GPIO pin - for example pin 23 (BCM numbering).
+
+Support for it is optional, so the app has to be built with the
+`motion-sensor` feature (see [Option 2: Build From
+Source](#option-2-build-from-source)):
+
+```bash
+cargo install syno-photo-frame --features motion-sensor
+```
+
+Then point the app at the pin, and optionally adjust how long it waits
+before switching the display off:
+
+```bash
+syno-photo-frame {share link} --motion-sensor-gpio 23 --motion-sensor-timeout 300
+```
+
+The user running the app has to be a member of the `gpio` group.
+
+The display is switched with `vcgencmd display_power {state}` by
+default, which works on Raspberry Pi OS with the KMS/FKMS driver. On
+other setups, use `--display-power-command` to provide something else,
+where `{state}` is replaced with 1 to switch the display on and 0 to
+switch it to standby. The command is run directly rather than through a
+shell, so anything needing more than one argument has to go into a
+script:
+
+```bash
+#!/bin/sh
+# /usr/local/bin/display-power.sh
+case "$1" in
+    1) wlr-randr --output HDMI-A-1 --on ;;
+    0) wlr-randr --output HDMI-A-1 --off ;;
+esac
+```
+
+```bash
+syno-photo-frame {share link} --motion-sensor-gpio 23     --display-power-command '/usr/local/bin/display-power.sh {state}'
+```
+
+The display is always switched back on when the app exits, so quitting
+it never leaves a dark screen behind.
 
 ### Start from a Random Photo and in Random Order
 
