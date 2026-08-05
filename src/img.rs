@@ -66,7 +66,7 @@ impl Framed for DynamicImage {
     }
 
     fn resize(&self, new_width: u32, new_height: u32) -> Self {
-        self.resize(new_width, new_height, FilterType::Lanczos3)
+        resize_preserving_aspect(self, (new_width, new_height), FilterType::Lanczos3)
     }
 
     fn rotate(&self, degrees: Rotation) -> Self {
@@ -199,14 +199,34 @@ fn background_fill_threads(
         ),
     );
     let bg_thread1 = thread::spawn(move || {
-        let bg = bg_crop1.resize(x_res, y_res, FilterType::Nearest);
+        let bg = resize_preserving_aspect(&bg_crop1, (x_res, y_res), FilterType::Nearest);
         brighten_and_blur(&bg)
     });
     let bg_thread2 = thread::spawn(move || {
-        let bg = bg_crop2.resize(x_res, y_res, FilterType::Nearest);
+        let bg = resize_preserving_aspect(&bg_crop2, (x_res, y_res), FilterType::Nearest);
         brighten_and_blur(&bg)
     });
     (bg_thread1, bg_thread2)
+}
+
+/// Resizes an image to the largest size fitting within `bounds`, preserving the aspect ratio.
+///
+/// Equivalent to [image::DynamicImage::resize], except that the target size is computed here
+/// instead of inside the `image` crate, so that the resize implementation can be replaced without
+/// affecting the resulting dimensions.
+fn resize_preserving_aspect(
+    original: &DynamicImage,
+    bounds: (u32, u32),
+    filter: FilterType,
+) -> DynamicImage {
+    if original.dimensions() == bounds {
+        return original.clone();
+    }
+
+    let (new_width, new_height) = Dimensions::from(original.dimensions())
+        .resize(Dimensions::from(bounds))
+        .to_rounded();
+    original.resize_exact(new_width, new_height, filter)
 }
 
 fn brighten_and_blur_background(background: &DynamicImage) -> DynamicImage {
@@ -237,6 +257,18 @@ impl Dimensions {
 
     const fn diff(self, Dimensions { w, h }: Dimensions) -> (f64, f64) {
         (f64::abs(self.w - w), f64::abs(self.h - h))
+    }
+
+    /// Rounds to integer dimensions the same way `image`'s internal `resize_dimensions` does, so
+    /// that replacing the resize implementation cannot change the result by a pixel.
+    ///
+    /// Not a `const fn`, unlike its neighbours: [f64::round] is not const-stable in this crate's
+    /// minimum supported Rust version.
+    fn to_rounded(self) -> (u32, u32) {
+        (
+            u32::max(self.w.round() as u32, 1),
+            u32::max(self.h.round() as u32, 1),
+        )
     }
 
     const fn is_exact_fit_to(self, target: Dimensions) -> bool {
