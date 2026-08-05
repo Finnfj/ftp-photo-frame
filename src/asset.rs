@@ -35,7 +35,7 @@ pub fn update_icon((screen_width, _): (u32, u32), rotation: Rotation) -> Result<
 #[cfg(not(target_os = "windows"))]
 pub(crate) const FONT_BYTES: &[u8] = include_bytes!("../assets/DejaVuSans-Bold.ttf");
 #[cfg(target_os = "windows")]
-pub(crate) const FONT_BYTES: &[u8] = include_bytes!("..\\assets\\DejaVuSans.ttf");
+pub(crate) const FONT_BYTES: &[u8] = include_bytes!("..\\assets\\DejaVuSans-Bold.ttf");
 
 fn load_and_resize(
     bytes: &[u8],
