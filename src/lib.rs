@@ -1,6 +1,7 @@
 //! # syno-photo-frame
 //!
-//! syno_photo_frame is a full-screen slideshow app for Synology Photos and Immich albums
+//! syno_photo_frame is a full-screen slideshow app for Synology Photos and Immich albums, and
+//! for photos on an FTP server
 
 pub use {api_client::LoginError, rand::RandomImpl};
 
@@ -21,9 +22,13 @@ use anyhow::{Result, bail};
 use chrono::Locale;
 
 use crate::{
-    api_client::{ApiClient, immich_client::ImmichApiClient, syno_client::SynoApiClient},
+    api_client::{
+        ApiClient, ftp_client::FtpApiClient, immich_client::ImmichApiClient,
+        syno_client::SynoApiClient,
+    },
     cli::{Backend, Cli},
     env::Env,
+    ftp::SuppaFtpTransport,
     http::{CookieStore, HttpClient},
     img::{DynamicImage, Framed},
     metadata::FromEnv,
@@ -36,6 +41,7 @@ use crate::{
 pub mod cli;
 pub mod env;
 pub mod error;
+pub mod ftp;
 pub mod http;
 pub mod logging;
 pub mod sdl;
@@ -143,6 +149,19 @@ where
         Backend::Immich => slideshow_loop(
             cli,
             ImmichApiClient::build(http_client, &cli.share_link)?.with_password(&cli.password),
+            sdl,
+            random,
+            update_check_receiver,
+            current_image,
+            env,
+        ),
+        Backend::Ftp => slideshow_loop(
+            cli,
+            FtpApiClient::build(
+                SuppaFtpTransport::new(Duration::from_secs(cli.timeout_seconds.into())),
+                &cli.share_link,
+            )?
+            .with_password(&cli.password),
             sdl,
             random,
             update_check_receiver,

@@ -4,8 +4,9 @@
 Version](https://img.shields.io/crates/v/syno-photo-frame)](https://crates.io/crates/syno-photo-frame)
 
 [Synology
-Photos](https://www.synology.com/en-global/dsm/feature/photos) and
-[Immich](https://immich.app/) full-screen slideshow for Raspberry Pi.
+Photos](https://www.synology.com/en-global/dsm/feature/photos),
+[Immich](https://immich.app/) and FTP full-screen slideshow for
+Raspberry Pi.
 
 <img src="doc/syno-photo-frame.png" width=600 />
 
@@ -25,6 +26,8 @@ __If you like the project, give it a star ⭐, or consider becoming a__
         - [Limitations](#limitations)
     - [Alternative: Immich](#alternative-immich)
         - [Limitations](#limitations-1)
+    - [Alternative: FTP Server](#alternative-ftp-server)
+        - [Limitations](#limitations-2)
     - [Raspberry Pi](#raspberry-pi)
       - [Option 1: Install From Debian Package](#option-1-install-from-debian-package)
       - [Option 2: Build From Source](#option-2-build-from-source)
@@ -100,6 +103,51 @@ when setting up the app on Raspberry Pi later on.
 ##### Limitations
 
 * Video playback is not supported
+
+### Alternative: FTP Server
+
+Photos can also be read straight from a directory on an FTP server,
+which is useful when the server hosting them has no photo album
+service - for example a NAS with FTP enabled and nothing else. Enable
+FTP on the server, note the address of the directory holding the
+photos, and write down an `ftp://` link to it in the form
+`ftp://user@server/path/to/photos`. An `@` in the user name has to be
+percent-encoded as `%40`, and the password is passed separately with
+the `--password` option. Leaving the user out of the link logs in
+anonymously.
+
+The directory is searched recursively, so photos may be organized in
+subdirectories. Files with a `.jpg`, `.jpeg` or `.png` extension are
+displayed, everything else is ignored, as are hidden entries and
+Synology's `@eaDir` thumbnail directories.
+
+The date shown by
+[--display-photo-info](#display-shooting-date-and-location) is taken
+from the photo's own EXIF metadata, falling back to the modification
+time reported by the server for photos that have none. `--order
+by-date` uses the same information. No location is displayed, since an
+FTP server exposes none.
+
+To protect the password and the photos on their way over the network,
+use an `ftps://` link instead, which secures the connection with TLS
+before logging in. This requires the app to be built with the `ftps`
+feature (see [Option 2: Build From
+Source](#option-2-build-from-source)), and the server certificate to
+be trusted by the system - a self-signed certificate has to be
+installed in the system's trust store first.
+
+##### Limitations
+
+* Video playback is not supported
+* Plain FTP transmits the password and the photos unencrypted; prefer
+  `ftps://` or a network you trust
+* Only passive mode is supported, and only explicit FTPS (`AUTH TLS`),
+  not implicit FTPS on port 990
+* `--source-size` has no effect, as an FTP server holds no scaled down
+  versions of a photo
+* Servers too old to support the `MLSD` command report no usable
+  modification times, in which case `--order by-date` falls back to
+  ordering by path for photos without EXIF metadata
 
 ### Raspberry Pi
 
@@ -186,6 +234,14 @@ cargo build --release
 
 The binary is then located at `target/release/syno-photo-frame`.
 
+To read photos over FTPS (see [Alternative: FTP
+Server](#alternative-ftp-server)), enable the `ftps` feature. It is
+optional because it is only needed for `ftps://` links:
+
+```bash
+cargo install syno-photo-frame --features ftps
+```
+
 ##### Alternative: Build With Docker
 
 If you don't want to install Rust or the build dependencies for some
@@ -206,6 +262,12 @@ Run the app:
 
 ```bash
 syno-photo-frame {sharing link to Synology Photos or Immich album}
+```
+
+or, when reading photos from an FTP server:
+
+```bash
+syno-photo-frame ftp://user@server/path/to/photos --password {password}
 ```
 
 If everything works as expected, press Ctrl-C to kill the app.

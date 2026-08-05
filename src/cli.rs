@@ -9,7 +9,7 @@ use clap::{ValueEnum, builder::TypedValueParser as _};
 
 use crate::http::Url;
 
-/// Synology Photos or Immich album fullscreen slideshow
+/// Synology Photos, Immich or FTP album fullscreen slideshow
 ///
 /// Project website: <https://github.com/caleb9/syno-photo-frame>
 #[derive(Debug, Parser)]
@@ -19,12 +19,15 @@ pub struct Cli {
     #[arg(long = "backend", value_enum, default_value_t = Backend::Auto)]
     pub backend: Backend,
 
-    /// Link to a publicly shared album on Synology Photos or Immich
+    /// Link to a publicly shared album on Synology Photos or Immich, or an ftp://user@host/path
+    /// link to a directory of photos on an FTP server (ftps:// requires a build with the "ftps"
+    /// feature)
     ///
-    /// Note that the album's privacy settings must be set to Public
+    /// Note that the album's privacy settings must be set to Public. For an FTP link, the user name
+    /// is taken from the link, and an anonymous login is used when it is omitted
     pub share_link: Url,
 
-    /// Link protection password if set in the album sharing settings
+    /// Link protection password if set in the album sharing settings, or the FTP account's password
     #[arg(short = 'p', long = "password")]
     pub password: Option<String>,
 
@@ -91,7 +94,7 @@ pub struct Cli {
     #[arg(long, default_value = "FFAA00")]
     pub text_color: String,
 
-    /// HTTP request timeout in seconds
+    /// Network request timeout in seconds
     ///
     /// Must be greater or equal to 5. When server does not respond within the timeout, an
     /// error is displayed. Try to increase the value for slow connections
@@ -103,7 +106,7 @@ pub struct Cli {
 
     /// Requested size of the photo as fetched from the Synology Photos. Can reduce network and CPU
     /// utilization at the cost of image quality. Note: photos are still scaled to full-screen
-    /// size. Ignored when using Immich backend.
+    /// size. Ignored when using the Immich or FTP backends.
     #[arg(long, value_enum, default_value_t = SourceSize::L)]
     pub source_size: SourceSize,
 
@@ -130,6 +133,8 @@ pub enum Backend {
     Synology,
     /// Immich
     Immich,
+    /// A directory on an FTP server
+    Ftp,
 }
 
 /// Slideshow ordering

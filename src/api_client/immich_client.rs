@@ -9,7 +9,7 @@ use serde_json::json;
 use crate::{
     LoginError,
     api_client::{
-        ApiClient, SharingId, SortBy,
+        ApiClient, PhotoNotFoundMapper, SharingId, SortBy,
         immich_client::dto::{
             AlbumResponseDto, AssetResponseDto, ExifResponseDto, GetAlbumInfoResponseDto,
             GetAssetInfoResponseDto, GetServerVersionResponseDto, SearchAssetsResponseDto,
@@ -83,7 +83,7 @@ impl<H: HttpClient> ApiClient for ImmichApiClient<'_, H> {
                 ("c", thumbhash),
             ],
         )?;
-        read_response(response, HttpResponse::bytes)
+        read_response(response, HttpResponse::bytes).map_photo_not_found()
     }
 }
 

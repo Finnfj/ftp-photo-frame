@@ -1,15 +1,16 @@
 use std::{fmt, ops::Deref, sync::OnceLock};
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use bytes::Bytes;
 use regex::Regex;
 
 use crate::{
     cli::{Backend, Order, SourceSize},
-    http::Url,
+    http::{InvalidHttpResponse, StatusCode, Url},
     metadata::Metadata,
 };
 
+pub mod ftp_client;
 pub mod immich_client;
 pub mod syno_client;
 
@@ -37,6 +38,43 @@ impl fmt::Display for LoginError {
 }
 
 impl std::error::Error for LoginError {}
+
+/// A photo is no longer available on the server, most likely because it has been removed from the
+/// album since its metadata was fetched. [crate::slideshow::Slideshow] skips such photos instead of
+/// displaying the error screen.
+///
+/// Backends signal this condition in different ways, so they wrap their own "not found" error in
+/// this type to keep the slideshow independent of any particular protocol.
+#[derive(Debug)]
+pub struct PhotoNotFound(pub anyhow::Error);
+
+impl fmt::Display for PhotoNotFound {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for PhotoNotFound {}
+
+/// Translates a HTTP 404 response into [PhotoNotFound]
+pub(crate) trait PhotoNotFoundMapper<T> {
+    fn map_photo_not_found(self) -> Result<T>;
+}
+
+impl<T> PhotoNotFoundMapper<T> for Result<T> {
+    fn map_photo_not_found(self) -> Result<T> {
+        self.map_err(|error| {
+            if matches!(
+                error.downcast_ref::<InvalidHttpResponse>(),
+                Some(InvalidHttpResponse(StatusCode::NOT_FOUND))
+            ) {
+                anyhow!(PhotoNotFound(error))
+            } else {
+                error
+            }
+        })
+    }
+}
 
 #[derive(Debug)]
 struct SharingId(String);
@@ -80,6 +118,11 @@ impl fmt::Display for SortBy {
 }
 
 pub fn detect_backend(share_link: &Url) -> Result<Backend> {
+    /* Checked before the patterns below, as the scheme is unambiguous */
+    if matches!(share_link.scheme(), "ftp" | "ftps") {
+        return Ok(Backend::Ftp);
+    }
+
     static SYNO_LINK_RE: OnceLock<Regex> = OnceLock::new();
     let syno_link_re = SYNO_LINK_RE
         .get_or_init(|| Regex::new(r"^https?://.+/[[:word:]]{2}/sharing/[^/]+/?$").unwrap());
@@ -138,6 +181,23 @@ mod tests {
         let result = detect_backend(&Url::parse(SHARE_LINK).unwrap());
 
         assert!(matches!(result, Ok(Backend::Immich)));
+    }
+
+    #[test]
+    fn when_ftp_share_link_then_detect_backend_returns_ftp() {
+        for share_link in [
+            "ftp://fake.nas/Photos",
+            "ftp://joe@fake.nas:2121/Photos/summer",
+            "ftp://fake.nas",
+            "ftps://fake.nas/Photos",
+        ] {
+            let result = detect_backend(&Url::parse(share_link).unwrap());
+
+            assert!(
+                matches!(result, Ok(Backend::Ftp)),
+                "link was {share_link}, result was {result:?}"
+            );
+        }
     }
 
     #[test]
