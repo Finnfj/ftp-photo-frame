@@ -1,8 +1,8 @@
-use std::{cell::RefCell, collections::VecDeque, ffi::OsStr, path::Path};
+use std::{cell::RefCell, collections::VecDeque, ffi::OsStr, io::Cursor, path::Path};
 
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use percent_encoding::percent_decode_str;
 
 use crate::{
@@ -46,6 +46,9 @@ pub struct FtpApiClient<T> {
     /// Overlapping borrows would panic, which is prevented by borrowing it in exactly one place:
     /// [FtpApiClient::with_reconnect].
     transport: RefCell<T>,
+
+    /// Path and bytes of the most recently downloaded photo, read by [ApiClient::get_exif]
+    last_photo: RefCell<Option<(String, Bytes)>>,
 }
 
 impl<T: FtpTransport> FtpApiClient<T> {
@@ -56,6 +59,7 @@ impl<T: FtpTransport> FtpApiClient<T> {
             credentials,
             root,
             transport: RefCell::new(transport),
+            last_photo: RefCell::new(None),
         })
     }
 
@@ -145,6 +149,22 @@ impl<T: FtpTransport> FtpApiClient<T> {
         Err(last_error.expect("at least one attempt must have failed"))
     }
 
+    /// [ApiClient::get_exif] does not receive the photo's bytes, and [crate::slideshow::Slideshow]
+    /// calls it right after [ApiClient::get_photo_bytes], so the bytes of the photo being displayed
+    /// are taken from here rather than downloaded a second time. [Bytes] is reference counted, so
+    /// this keeps one photo's buffer alive and copies nothing.
+    fn cached_photo_bytes(&self, path: &str) -> Option<Bytes> {
+        match self.last_photo.borrow().as_ref() {
+            Some((cached_path, bytes)) if cached_path == path => Some(bytes.clone()),
+            _ => {
+                log::debug!(
+                    "Bytes of {path} are not available, falling back to its modification time"
+                );
+                None
+            }
+        }
+    }
+
     /// Turns a path relative to [FtpApiClient::root] into an absolute one
     fn absolute(&self, relative: &str) -> String {
         if relative.is_empty() {
@@ -184,9 +204,20 @@ impl<T: FtpTransport> ApiClient for FtpApiClient<T> {
         Ok(photos)
     }
 
+    /// The time a photo was taken is only known from its own EXIF metadata; an FTP server has
+    /// nothing else to offer. Photos without it, such as scans or downloads, fall back to the
+    /// modification time reported by the server.
     fn get_exif(&self, photo: &Self::Photo) -> Result<impl Metadata> {
-        let Some(date) = photo.modified else {
-            bail!("No modification time was reported for {}", photo.path)
+        let date = self
+            .cached_photo_bytes(&photo.path)
+            .as_deref()
+            .and_then(exif_date)
+            .or(photo.modified);
+        let Some(date) = date else {
+            bail!(
+                "Neither EXIF metadata nor a modification time is available for {}",
+                photo.path
+            )
         };
         Ok(FtpMetadata { date })
     }
@@ -194,8 +225,12 @@ impl<T: FtpTransport> ApiClient for FtpApiClient<T> {
     /// [SourceSize] does not apply, as an FTP server offers no scaled down versions of a file
     fn get_photo_bytes(&self, photo: &Self::Photo, _: SourceSize) -> Result<Bytes> {
         let path = self.absolute(&photo.path);
-        self.with_reconnect(|transport| transport.retrieve(&path))
-            .map_err(map_photo_not_found)
+        let bytes = self
+            .with_reconnect(|transport| transport.retrieve(&path))
+            .map_err(map_photo_not_found)?;
+        self.last_photo
+            .replace(Some((photo.path.clone(), bytes.clone())));
+        Ok(bytes)
     }
 }
 
@@ -224,6 +259,35 @@ impl Metadata for FtpMetadata {
     fn location(&self) -> Location {
         Location::default()
     }
+}
+
+/// Reads the time a photo was taken from its EXIF metadata, if it has any
+fn exif_date(bytes: &[u8]) -> Option<DateTime<Utc>> {
+    let exif = exif::Reader::new()
+        .read_from_container(&mut Cursor::new(bytes))
+        .inspect_err(|error| log::debug!("No EXIF metadata: {error}"))
+        .ok()?;
+    let field = exif.get_field(exif::Tag::DateTimeOriginal, exif::In::PRIMARY)?;
+    let exif::Value::Ascii(values) = &field.value else {
+        return None;
+    };
+    let date_time = exif::DateTime::from_ascii(values.first()?)
+        .inspect_err(|error| log::debug!("Unusable EXIF DateTimeOriginal: {error}"))
+        .ok()?;
+    /* DateTimeOriginal is the local time where the photo was taken and carries no time zone. It is
+     * displayed as it is rather than shifted by a guessed offset, which is also what the Immich
+     * backend does with its localDateTime. */
+    NaiveDate::from_ymd_opt(
+        date_time.year.into(),
+        date_time.month.into(),
+        date_time.day.into(),
+    )?
+    .and_hms_opt(
+        date_time.hour.into(),
+        date_time.minute.into(),
+        date_time.second.into(),
+    )
+    .map(|naive| naive.and_utc())
 }
 
 /// Sorts photos in ascending order, which is what [crate::slideshow::Slideshow] expects. Photos
@@ -836,6 +900,121 @@ mod tests {
         let result = client.get_exif(&photo);
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn get_exif_prefers_the_date_the_photo_was_taken() {
+        let mut transport = MockFtpTransport::new();
+        expect_connected(&mut transport);
+        transport
+            .expect_retrieve()
+            .return_once(|_| Ok(jpeg_with_exif_date("2019:07:14 09:12:45")));
+        let client = new_client(transport, SHARE_LINK);
+        let photo = new_photo("a.jpg", Some(1));
+
+        client.get_photo_bytes(&photo, SourceSize::L).unwrap();
+        let metadata = client.get_exif(&photo).unwrap();
+
+        assert_eq!(
+            metadata.date(),
+            Utc.with_ymd_and_hms(2019, 7, 14, 9, 12, 45).unwrap(),
+            "the EXIF date must win over the modification time"
+        );
+    }
+
+    #[test]
+    fn get_exif_falls_back_to_the_modification_time_without_usable_exif_metadata() {
+        for bytes in [
+            /* An empty JPEG carries no EXIF metadata at all */
+            Bytes::from_static(&[0xFF, 0xD8, 0xFF, 0xD9]),
+            /* Nor does something that is not an image */
+            Bytes::from_static(b"not an image"),
+            jpeg_with_exif_date("    :  :     :  :  "),
+        ] {
+            let mut transport = MockFtpTransport::new();
+            expect_connected(&mut transport);
+            transport.expect_retrieve().return_once(|_| Ok(bytes));
+            let client = new_client(transport, SHARE_LINK);
+            let photo = new_photo("a.jpg", Some(1));
+
+            client.get_photo_bytes(&photo, SourceSize::L).unwrap();
+            let metadata = client.get_exif(&photo).unwrap();
+
+            assert_eq!(metadata.date(), timestamp(1));
+        }
+    }
+
+    #[test]
+    fn get_exif_falls_back_to_the_modification_time_without_downloading_the_photo_again() {
+        let mut transport = MockFtpTransport::new();
+        /* Downloading a photo just to read its date would double the transferred data */
+        transport.expect_retrieve().never();
+        let client = new_client(transport, SHARE_LINK);
+        let photo = new_photo("never_downloaded.jpg", Some(1));
+
+        let metadata = client.get_exif(&photo).unwrap();
+
+        assert_eq!(metadata.date(), timestamp(1));
+    }
+
+    /// Builds the smallest JPEG a DateTimeOriginal can be read from: an APP1 segment holding a TIFF
+    /// structure whose IFD0 points at an Exif IFD with a single entry. No pixel data is needed, as
+    /// EXIF metadata lives in the marker segments.
+    fn jpeg_with_exif_date(date_time_original: &str) -> Bytes {
+        const TIFF_HEADER_SIZE: u32 = 8;
+        /* Entry count, one 12 byte entry, and the offset of the next directory */
+        const IFD_SIZE: u32 = 2 + 12 + 4;
+        const EXIF_IFD_OFFSET: u32 = TIFF_HEADER_SIZE + IFD_SIZE;
+        const VALUE_OFFSET: u32 = EXIF_IFD_OFFSET + IFD_SIZE;
+        const TAG_EXIF_IFD_POINTER: u16 = 0x8769;
+        const TAG_DATE_TIME_ORIGINAL: u16 = 0x9003;
+        const TYPE_ASCII: u16 = 2;
+        const TYPE_LONG: u16 = 4;
+
+        let mut value = date_time_original.as_bytes().to_vec();
+        value.push(0);
+        assert_eq!(value.len(), 20, "an EXIF date is 19 characters and a NUL");
+
+        let mut tiff = vec![];
+        /* Little-endian TIFF header */
+        tiff.extend(b"II");
+        tiff.extend(42u16.to_le_bytes());
+        tiff.extend(TIFF_HEADER_SIZE.to_le_bytes());
+        /* IFD0, holding only a pointer to the Exif IFD */
+        tiff.extend(1u16.to_le_bytes());
+        tiff.extend(TAG_EXIF_IFD_POINTER.to_le_bytes());
+        tiff.extend(TYPE_LONG.to_le_bytes());
+        tiff.extend(1u32.to_le_bytes());
+        tiff.extend(EXIF_IFD_OFFSET.to_le_bytes());
+        tiff.extend(0u32.to_le_bytes());
+        /* Exif IFD, holding only the date */
+        tiff.extend(1u16.to_le_bytes());
+        tiff.extend(TAG_DATE_TIME_ORIGINAL.to_le_bytes());
+        tiff.extend(TYPE_ASCII.to_le_bytes());
+        tiff.extend(u32::try_from(value.len()).unwrap().to_le_bytes());
+        tiff.extend(VALUE_OFFSET.to_le_bytes());
+        tiff.extend(0u32.to_le_bytes());
+        assert_eq!(u32::try_from(tiff.len()).unwrap(), VALUE_OFFSET);
+        tiff.extend(value);
+
+        let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xE1];
+        /* The segment length covers itself, the identifier and the TIFF structure */
+        jpeg.extend(u16::try_from(2 + 6 + tiff.len()).unwrap().to_be_bytes());
+        jpeg.extend(b"Exif\0\0");
+        jpeg.extend(tiff);
+        jpeg.extend([0xFF, 0xD9]);
+        Bytes::from(jpeg)
+    }
+
+    #[test]
+    fn the_exif_test_fixture_is_readable() {
+        /* Without this, a broken fixture would silently exercise only the fallback path above */
+        let date = exif_date(&jpeg_with_exif_date("2019:07:14 09:12:45"));
+
+        assert_eq!(
+            date,
+            Some(Utc.with_ymd_and_hms(2019, 7, 14, 9, 12, 45).unwrap())
+        );
     }
 
     fn new_client<T: FtpTransport>(transport: T, share_link: &str) -> FtpApiClient<T> {
