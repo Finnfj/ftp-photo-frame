@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Format, lint and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --assume-yes --no-install-recommends \
+            cmake libsdl2-dev libsdl2-gfx-dev libsdl2-ttf-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo fmt --all --check
+
+      # Scoped to this invocation rather than set through RUSTFLAGS, which would also deny warnings
+      # in dependencies and invalidate the cache
+      - run: cargo clippy --locked --all-targets --all-features -- --deny warnings
+
+      - run: cargo test --locked --all-features
+
+  build:
+    name: Release binary for aarch64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: aarch64
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      # The SDL2 libraries for the target architecture come from docker/Dockerfile, see Cross.toml
+      - run: cross build --locked --release --all-features --target aarch64-unknown-linux-gnu
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: syno-photo-frame-aarch64
+          path: target/aarch64-unknown-linux-gnu/release/syno-photo-frame
+          if-no-files-found: error
+          retention-days: 14

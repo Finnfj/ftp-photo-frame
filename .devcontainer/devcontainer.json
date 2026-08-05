@@ -1,0 +1,20 @@
+// For format details, see https://aka.ms/devcontainer.json
+{
+	"name": "syno-photo-frame",
+	"build": {
+		// One level up, so that the build context is the repository root
+		"context": "..",
+		"dockerfile": "Dockerfile"
+	},
+	"features": {
+		// cross-rs needs a container engine of its own
+		"ghcr.io/devcontainers/features/docker-outside-of-docker:1": {}
+	},
+	"customizations": {
+		"vscode": {
+			"extensions": [
+				"rust-lang.rust-analyzer"
+			]
+		}
+	}
+}
