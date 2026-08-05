@@ -29,6 +29,8 @@ exclude = [
 default = []
 # FTPS support for the FTP backend, i.e. ftps:// share links
 ftps = ["dep:rustls", "dep:rustls-platform-verifier", "suppaftp/rustls-aws-lc-rs"]
+# Support for a motion sensor switching the display off, see --motion-sensor-gpio
+motion-sensor = ["dep:rppal"]
 
 [dependencies]
 anyhow = "1.*"
@@ -51,6 +53,10 @@ syno_api = "0.6"
 suppaftp = { version = "10", default-features = false }
 percent-encoding = "2.3.2"
 kamadak-exif = "0.6.1"
+
+# Raspberry Pi GPIO access, needed by the optional motion sensor support
+[target.'cfg(target_os = "linux")'.dependencies]
+rppal = { version = "0.22.*", optional = true }
 
 [dev-dependencies]
 mock_instant = "0.6.*"
