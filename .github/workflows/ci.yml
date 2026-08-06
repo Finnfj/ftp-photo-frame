@@ -52,6 +52,13 @@ jobs:
         with:
           tool: cross
 
+      # Installing the SDL2 packages for the target architecture (see docker/Dockerfile) runs their
+      # maintainer scripts, which are aarch64 executables, so the kernel has to know how to run
+      # those. Nothing else about the build is emulated.
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
       # The SDL2 libraries for the target architecture come from docker/Dockerfile, see Cross.toml
       - run: cross build --locked --release --all-features --target aarch64-unknown-linux-gnu
 
