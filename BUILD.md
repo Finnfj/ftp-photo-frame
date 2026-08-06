@@ -41,6 +41,17 @@ cargo install cross --git https://github.com/cross-rs/cross
 cross build --release --all-features --target aarch64-unknown-linux-gnu
 ```
 
+The first build extends the stock cross image with the SDL2 packages for the target architecture,
+which runs their aarch64 maintainer scripts. The host therefore has to know how to execute aarch64
+binaries, which is a one-time registration:
+
+```bash
+docker run --privileged --rm multiarch/qemu-user-static --reset -p yes
+```
+
+Without it, the image build fails with `/usr/bin/python3.12: Exec format error`. Only those install
+scripts are emulated; compiling is a genuine cross-compile.
+
 The binary ends up in `target/aarch64-unknown-linux-gnu/release/syno-photo-frame`.
 
 `Cross.toml` points cross at `docker/Dockerfile`, which adds the SDL2 libraries
