@@ -1,0 +1,501 @@
+<!--
+  The whole web app: markup, style and behaviour in one file with no request to anywhere else, so
+  that the page can forbid every external source in its Content-Security-Policy.
+
+  Two rules matter when changing this. File names come from the FTP server and may contain
+  anything, so they only ever reach the page through textContent and only ever reach a URL through
+  encodeURIComponent. And every request that changes something carries the X-Photo-Frame header,
+  which is what tells this server the request came from here rather than from another site the
+  browser happened to have open.
+-->
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Photo frame</title>
+
+<style>
+  :root {
+    --background: #14161a;
+    --surface: #1e222a;
+    --surface-raised: #272c36;
+    --border: #333a47;
+    --text: #e7e9ee;
+    --muted: #949cad;
+    --accent: #ffaa00;
+    --danger: #ff6b5e;
+  }
+
+  * { box-sizing: border-box; }
+
+  /* The rules below set `display` on elements that are hidden at times, and any of them would beat
+     the browser's own rule for the hidden attribute */
+  [hidden] { display: none !important; }
+
+  body {
+    margin: 0;
+    padding: 0 0 5rem;
+    background: var(--background);
+    color: var(--text);
+    font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    -webkit-text-size-adjust: 100%;
+  }
+
+  header {
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    padding: env(safe-area-inset-top) 0 0;
+  }
+
+  #breadcrumb {
+    display: flex;
+    align-items: center;
+    gap: .25rem;
+    overflow-x: auto;
+    white-space: nowrap;
+    padding: .75rem 1rem;
+    scrollbar-width: none;
+  }
+  #breadcrumb::-webkit-scrollbar { display: none; }
+
+  #breadcrumb button {
+    background: none;
+    border: 0;
+    color: var(--accent);
+    font: inherit;
+    padding: .25rem .1rem;
+    cursor: pointer;
+  }
+  #breadcrumb .separator { color: var(--muted); }
+  #breadcrumb .current { color: var(--text); padding: .25rem .1rem; }
+
+  #toolbar {
+    display: flex;
+    gap: .5rem;
+    padding: 0 1rem .75rem;
+    flex-wrap: wrap;
+  }
+
+  .button {
+    display: inline-flex;
+    align-items: center;
+    gap: .4rem;
+    min-height: 2.75rem;
+    padding: 0 1rem;
+    border: 1px solid var(--border);
+    border-radius: .6rem;
+    background: var(--surface-raised);
+    color: var(--text);
+    font: inherit;
+    cursor: pointer;
+  }
+  .button:disabled { opacity: .5; cursor: default; }
+  .button.primary { background: var(--accent); border-color: var(--accent); color: #1a1204; font-weight: 600; }
+  .button.danger { color: var(--danger); }
+
+  #file-input { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+
+  main { padding: 1rem; }
+
+  #folders { list-style: none; margin: 0 0 1rem; padding: 0; }
+  #folders li { border-bottom: 1px solid var(--border); }
+  #folders button {
+    display: flex;
+    align-items: center;
+    gap: .75rem;
+    width: 100%;
+    min-height: 3rem;
+    padding: .5rem 0;
+    background: none;
+    border: 0;
+    color: var(--text);
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+  }
+  #folders .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #folders .chevron { color: var(--muted); }
+
+  #grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
+    gap: 4px;
+  }
+
+  .tile {
+    position: relative;
+    aspect-ratio: 1;
+    background: var(--surface);
+    border-radius: .4rem;
+    overflow: hidden;
+  }
+  .tile img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .tile img.broken { opacity: .25; }
+  .tile .caption {
+    position: absolute;
+    inset: auto 0 0 0;
+    padding: .3rem .4rem;
+    font-size: .7rem;
+    line-height: 1.2;
+    background: rgba(0, 0, 0, .6);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .tile .remove {
+    position: absolute;
+    top: .25rem;
+    right: .25rem;
+    width: 1.9rem;
+    height: 1.9rem;
+    border: 0;
+    border-radius: 50%;
+    background: rgba(0, 0, 0, .6);
+    color: #fff;
+    font-size: 1rem;
+    line-height: 1;
+    cursor: pointer;
+  }
+
+  #empty, #load-more { text-align: center; color: var(--muted); padding: 2rem 0; }
+
+  #progress {
+    position: fixed;
+    inset: auto 0 0 0;
+    z-index: 3;
+    background: var(--surface);
+    border-top: 1px solid var(--border);
+    padding: .75rem 1rem calc(.75rem + env(safe-area-inset-bottom));
+  }
+  #progress .label { display: flex; justify-content: space-between; gap: 1rem; font-size: .85rem; }
+  #progress .label .file { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #progress .track { height: .4rem; margin-top: .5rem; background: var(--surface-raised); border-radius: .2rem; }
+  #progress .bar { height: 100%; width: 0; background: var(--accent); border-radius: .2rem; transition: width .1s linear; }
+
+  #toast {
+    position: fixed;
+    left: 1rem;
+    right: 1rem;
+    bottom: calc(1rem + env(safe-area-inset-bottom));
+    z-index: 4;
+    padding: .75rem 1rem;
+    border-radius: .6rem;
+    background: var(--surface-raised);
+    border: 1px solid var(--danger);
+    color: var(--text);
+    box-shadow: 0 .5rem 1.5rem rgba(0, 0, 0, .5);
+  }
+</style>
+
+<header>
+  <nav id="breadcrumb" aria-label="Folders"></nav>
+  <div id="toolbar">
+    <label class="button primary" for="file-input">Upload photos</label>
+    <input id="file-input" type="file" multiple accept="image/jpeg,image/png,.jpg,.jpeg,.png">
+    <button class="button" id="new-folder">New folder</button>
+    <button class="button danger" id="remove-folder" hidden>Delete this folder</button>
+  </div>
+</header>
+
+<main>
+  <ul id="folders"></ul>
+  <div id="grid"></div>
+  <div id="empty" hidden>This folder is empty.</div>
+  <button class="button" id="load-more" hidden></button>
+</main>
+
+<div id="progress" hidden>
+  <div class="label"><span class="file"></span><span class="count"></span></div>
+  <div class="track"><div class="bar"></div></div>
+</div>
+
+<div id="toast" hidden role="alert"></div>
+
+<script>
+  'use strict';
+
+  /* Tells the server the request came from this page. A form on another site cannot set a header,
+   * and a fetch that sets one has to pass a preflight the server never answers, which is what
+   * keeps the browser's stored password from being used against the frame from elsewhere. */
+  const GUARD_HEADER = 'X-Photo-Frame';
+
+  /* Rendering every tile of a folder holding hundreds of photos would have the frame fetch and
+   * scale all of them, so they arrive a screenful at a time */
+  const PAGE_SIZE = 60;
+
+  const ROOT_LABEL = 'Photos';
+
+  const el = {
+    breadcrumb: document.getElementById('breadcrumb'),
+    folders: document.getElementById('folders'),
+    grid: document.getElementById('grid'),
+    empty: document.getElementById('empty'),
+    loadMore: document.getElementById('load-more'),
+    fileInput: document.getElementById('file-input'),
+    newFolder: document.getElementById('new-folder'),
+    removeFolder: document.getElementById('remove-folder'),
+    progress: document.getElementById('progress'),
+    progressFile: document.querySelector('#progress .file'),
+    progressCount: document.querySelector('#progress .count'),
+    progressBar: document.querySelector('#progress .bar'),
+    toast: document.getElementById('toast'),
+  };
+
+  /* Path of the folder on screen, relative to the shared directory, "" for the shared directory
+   * itself. Segments are joined with a slash; the whole thing is percent-encoded when it goes
+   * into a URL, so a slash inside it survives as a separator. */
+  let currentPath = '';
+  let shown = 0;
+  let photos = [];
+
+  /* Requests */
+
+  function url(route, parameters) {
+    const query = Object.entries(parameters)
+      .map(([key, value]) => `${key}=${encodeURIComponent(value)}`)
+      .join('&');
+    return `${route}?${query}`;
+  }
+
+  async function request(method, route, parameters, body, onProgress) {
+    const target = url(route, parameters);
+    if (method === 'GET') {
+      return unwrap(await fetch(target, { headers: { [GUARD_HEADER]: '1' } }));
+    }
+    /* XMLHttpRequest rather than fetch, because it is the only one that reports how much of an
+     * upload has gone out, and a photo over a home network takes long enough to need that */
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open(method, target);
+      xhr.setRequestHeader(GUARD_HEADER, '1');
+      if (onProgress) {
+        xhr.upload.onprogress = (event) => {
+          if (event.lengthComputable) onProgress(event.loaded / event.total);
+        };
+      }
+      xhr.onload = () => {
+        if (xhr.status === 401) return reject(unauthorized());
+        if (xhr.status >= 400) return reject(new Error(messageOf(xhr.responseText, xhr.status)));
+        resolve(xhr.responseText ? JSON.parse(xhr.responseText) : null);
+      };
+      xhr.onerror = () => reject(new Error('The frame could not be reached'));
+      xhr.send(body);
+    });
+  }
+
+  async function unwrap(response) {
+    if (response.status === 401) throw unauthorized();
+    const text = await response.text();
+    if (!response.ok) throw new Error(messageOf(text, response.status));
+    return text ? JSON.parse(text) : null;
+  }
+
+  function messageOf(text, status) {
+    try {
+      const error = JSON.parse(text).error;
+      if (error) return error;
+    } catch (ignored) { /* not every failure has a body this page produced */ }
+    return `The frame answered with ${status}`;
+  }
+
+  function unauthorized() {
+    /* Reloading brings the browser's own login dialog back, which is the only way to correct a
+     * password that was typed wrong */
+    location.reload();
+    return new Error('Not logged in');
+  }
+
+  /* Rendering */
+
+  function segments(path) {
+    return path === '' ? [] : path.split('/');
+  }
+
+  function renderBreadcrumb() {
+    el.breadcrumb.replaceChildren();
+    const parts = segments(currentPath);
+    const crumb = (label, path, isLast) => {
+      if (isLast) {
+        const span = document.createElement('span');
+        span.className = 'current';
+        span.textContent = label;
+        return span;
+      }
+      const button = document.createElement('button');
+      button.textContent = label;
+      button.onclick = () => openFolder(path);
+      return button;
+    };
+    el.breadcrumb.append(crumb(ROOT_LABEL, '', parts.length === 0));
+    parts.forEach((part, index) => {
+      const separator = document.createElement('span');
+      separator.className = 'separator';
+      separator.textContent = '›';
+      el.breadcrumb.append(separator);
+      el.breadcrumb.append(
+        crumb(part, parts.slice(0, index + 1).join('/'), index === parts.length - 1));
+    });
+  }
+
+  function renderFolders(directories) {
+    el.folders.replaceChildren();
+    for (const directory of directories) {
+      const name = document.createElement('span');
+      name.className = 'name';
+      name.textContent = directory.name;
+      const chevron = document.createElement('span');
+      chevron.className = 'chevron';
+      chevron.textContent = '›';
+
+      const button = document.createElement('button');
+      button.append(folderIcon(), name, chevron);
+      button.onclick = () =>
+        openFolder(currentPath === '' ? directory.name : `${currentPath}/${directory.name}`);
+
+      const item = document.createElement('li');
+      item.append(button);
+      el.folders.append(item);
+    }
+  }
+
+  function folderIcon() {
+    const icon = document.createElement('span');
+    icon.textContent = '📁';
+    icon.setAttribute('aria-hidden', 'true');
+    return icon;
+  }
+
+  function renderNextPage() {
+    const page = photos.slice(shown, shown + PAGE_SIZE);
+    for (const photo of page) el.grid.append(tileFor(photo));
+    shown += page.length;
+
+    const remaining = photos.length - shown;
+    el.loadMore.hidden = remaining <= 0;
+    el.loadMore.textContent = `Show ${Math.min(remaining, PAGE_SIZE)} more of ${remaining}`;
+  }
+
+  function tileFor(photo) {
+    const path = currentPath === '' ? photo.name : `${currentPath}/${photo.name}`;
+
+    const image = document.createElement('img');
+    /* Load only what is actually scrolled into view: this is what keeps a folder of five hundred
+     * photos from asking the frame for five hundred downloads at once */
+    image.loading = 'lazy';
+    image.decoding = 'async';
+    image.alt = photo.name;
+    image.src = url('/api/thumbnail', { path });
+    image.onerror = () => image.classList.add('broken');
+
+    const caption = document.createElement('div');
+    caption.className = 'caption';
+    caption.textContent = photo.name;
+
+    const remove = document.createElement('button');
+    remove.className = 'remove';
+    remove.title = `Delete ${photo.name}`;
+    remove.textContent = '×';
+
+    const tile = document.createElement('div');
+    tile.className = 'tile';
+    remove.onclick = () => deletePhoto(path, photo.name, tile);
+    tile.append(image, caption, remove);
+    return tile;
+  }
+
+  function showError(error) {
+    el.toast.textContent = error.message;
+    el.toast.hidden = false;
+    clearTimeout(showError.timer);
+    showError.timer = setTimeout(() => { el.toast.hidden = true; }, 6000);
+  }
+
+  /* Actions */
+
+  async function openFolder(path) {
+    try {
+      const listing = await request('GET', '/api/list', { path });
+      currentPath = path;
+      photos = listing.photos;
+      shown = 0;
+      el.grid.replaceChildren();
+      renderBreadcrumb();
+      renderFolders(listing.directories);
+      renderNextPage();
+      el.empty.hidden = listing.directories.length > 0 || photos.length > 0;
+      /* Only an empty folder can be removed, and never the shared directory itself */
+      el.removeFolder.hidden = !(path !== '' && listing.directories.length === 0 && photos.length === 0);
+      scrollTo({ top: 0 });
+    } catch (error) {
+      showError(error);
+    }
+  }
+
+  async function uploadAll(files) {
+    el.fileInput.disabled = true;
+    el.progress.hidden = false;
+    let uploaded = 0;
+    try {
+      /* One at a time. The frame holds a single FTP session, so parallel uploads would queue up
+       * inside it anyway, and this way the progress bar means something. */
+      for (const file of files) {
+        el.progressFile.textContent = file.name;
+        el.progressCount.textContent = `${uploaded + 1} of ${files.length}`;
+        el.progressBar.style.width = '0';
+        await request('POST', '/api/upload', { path: currentPath, name: file.name }, file,
+          (fraction) => { el.progressBar.style.width = `${Math.round(fraction * 100)}%`; });
+        uploaded += 1;
+      }
+    } catch (error) {
+      showError(error);
+    } finally {
+      el.progress.hidden = true;
+      el.fileInput.disabled = false;
+      el.fileInput.value = '';
+      if (uploaded > 0) await openFolder(currentPath);
+    }
+  }
+
+  async function deletePhoto(path, name, tile) {
+    if (!confirm(`Delete ${name}?`)) return;
+    try {
+      await request('POST', '/api/delete', { path });
+      tile.remove();
+      photos = photos.filter((photo) => photo.name !== name);
+      shown -= 1;
+    } catch (error) {
+      showError(error);
+    }
+  }
+
+  async function createFolder() {
+    const name = prompt('Name of the new folder');
+    if (name === null || name.trim() === '') return;
+    try {
+      await request('POST', '/api/mkdir', { path: currentPath, name: name.trim() });
+      await openFolder(currentPath);
+    } catch (error) {
+      showError(error);
+    }
+  }
+
+  async function removeFolder() {
+    const name = segments(currentPath).pop();
+    if (!confirm(`Delete the empty folder ${name}?`)) return;
+    try {
+      await request('POST', '/api/rmdir', { path: currentPath });
+      await openFolder(segments(currentPath).slice(0, -1).join('/'));
+    } catch (error) {
+      showError(error);
+    }
+  }
+
+  el.fileInput.onchange = () => {
+    if (el.fileInput.files.length > 0) uploadAll([...el.fileInput.files]);
+  };
+  el.newFolder.onclick = createFolder;
+  el.removeFolder.onclick = removeFolder;
+  el.loadMore.onclick = renderNextPage;
+
+  openFolder('');
+</script>
