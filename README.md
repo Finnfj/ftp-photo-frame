@@ -28,6 +28,8 @@ __If you like the project, give it a star ⭐, or consider becoming a__
         - [Limitations](#limitations-1)
     - [Alternative: FTP Server](#alternative-ftp-server)
         - [Limitations](#limitations-2)
+      - [Web App](#web-app)
+        - [Limitations](#limitations-3)
     - [Raspberry Pi](#raspberry-pi)
       - [Option 1: Install From Debian Package](#option-1-install-from-debian-package)
       - [Option 2: Build From Source](#option-2-build-from-source)
@@ -150,6 +152,54 @@ installed in the system's trust store first.
   modification times, in which case `--order by-date` falls back to
   ordering by path for photos without EXIF metadata
 
+#### Web App
+
+With the FTP backend, the frame can serve a small page on the local
+network for managing the photos from a phone or a laptop: browse the
+folders, look at previews, upload photos into a folder of your choice,
+delete photos, and create or remove folders. It requires a build with
+the `web` feature (see [Option 2: Build From
+Source](#option-2-build-from-source)) and a password:
+
+```bash
+SYNO_PHOTO_FRAME_WEB_PASSWORD=<password> \
+  syno-photo-frame ftp://user@server/path/to/photos --password <ftp-password>
+```
+
+Then open `http://<frame-address>:8080/` and log in with the user name
+`frame` (change it with `--web-user`) and that password. Pass the
+password with `--web-password` instead of the environment variable only
+if you do not mind it being visible to other users of the machine in
+the process list; when the frame is started by systemd, an
+`Environment=` line in the unit file is the better place for it. Use
+`--web-bind` to change the address and port.
+
+A photo uploaded this way appears on the frame within one
+`--interval` rather than only after the current round through the album
+has finished. Note that this restarts the round, so with `--order
+by-date` the slideshow returns to the oldest photo, and with `--order
+random` the photos are shuffled again.
+
+##### Limitations
+
+* The connection is **not encrypted**. The password is sent, readable
+  by anyone on the network, with every single request, and so are the
+  photos. Only use this on a network you trust, and pick a password you
+  use nowhere else
+* Only `.jpg`, `.jpeg` and `.png` files can be uploaded. Photos a phone
+  stores as HEIC have to be converted first, which the sharing dialog
+  usually offers to do
+* The frame opens a second FTP session for the web app. A server
+  configured to allow only one session per account will refuse it, and
+  the page then reports what the server said
+* Only empty folders can be deleted, and never the folder the share
+  link points at
+* Previews are rendered on the frame. The first visit to a large folder
+  is slow, as every photo has to be downloaded once, and they are
+  rendered again after a restart
+* A photo deleted while it is on screen stays there until the next one
+  is due
+
 ### Raspberry Pi
 
 Let's assume that you're starting with a fresh installation of
@@ -235,14 +285,16 @@ cargo build --release
 
 The binary is then located at `target/release/syno-photo-frame`.
 
-Two optional features are not built by default, because most setups do
-not need them: `ftps` for reading photos over FTPS (see [Alternative:
-FTP Server](#alternative-ftp-server)), and `motion-sensor` for
-switching the display off while nobody is around (see [Motion
-Sensor](#motion-sensor)). Enable either or both:
+Three optional features are not built by default, because most setups
+do not need them: `ftps` for reading photos over FTPS (see
+[Alternative: FTP Server](#alternative-ftp-server)), `web` for
+managing the photos from a phone or a laptop (see [Web
+App](#web-app)), and `motion-sensor` for switching the display off
+while nobody is around (see [Motion Sensor](#motion-sensor)). Enable
+any combination of them:
 
 ```bash
-cargo install syno-photo-frame --features ftps,motion-sensor
+cargo install syno-photo-frame --features ftps,web,motion-sensor
 ```
 
 ##### Alternative: Build With Docker

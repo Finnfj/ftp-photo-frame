@@ -24,8 +24,18 @@ cargo clippy --all-targets --all-features -- --deny warnings
 cargo fmt --all --check
 ```
 
-`--all-features` also covers `ftps` (FTPS support) and `motion-sensor` (GPIO
-support), neither of which is enabled by default.
+`--all-features` also covers `ftps` (FTPS support), `motion-sensor` (GPIO
+support) and `web` (the web app for managing photos, see
+[Web App](README.md#web-app)), none of which are enabled by default.
+
+To look at the web app's page while working on it, without an FTP server:
+
+```bash
+cargo test --all-features -- --ignored --nocapture serve_a_fake_album
+```
+
+It serves a made-up album on <http://127.0.0.1:8099/> until interrupted, and
+prints the credentials to log in with.
 
 ## Cross-compiling for the Raspberry Pi
 
