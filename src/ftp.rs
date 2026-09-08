@@ -45,6 +45,48 @@ pub trait FtpTransport {
     fn disconnect(&mut self);
 }
 
+/// One reconnect is enough to recover from the far most common failure: the server dropping an idle
+/// session between two operations
+pub(crate) const MAX_ATTEMPTS: usize = 2;
+
+/// Runs an operation, reconnecting and retrying it once if the connection turned out to be dead.
+///
+/// A free function rather than a method, so that anything holding its own session can share it:
+/// an FTP session is stateful and cannot be handed around.
+///
+/// Only for operations that can be repeated without consequence. An upload cannot: its source has
+/// already been consumed by the time the first attempt fails, so a second one would store an empty
+/// file.
+pub fn with_reconnect<T: FtpTransport, R>(
+    transport: &mut T,
+    address: &FtpAddress,
+    credentials: &Credentials,
+    mut operation: impl FnMut(&mut T) -> Result<R>,
+) -> Result<R> {
+    let mut last_error = None;
+    for attempt in 1..=MAX_ATTEMPTS {
+        if !transport.is_connected()
+            && let Err(error) = transport.connect(address, credentials)
+        {
+            log::warn!("Cannot connect to the FTP server (attempt {attempt}): {error}");
+            transport.disconnect();
+            last_error = Some(error);
+            continue;
+        }
+        match operation(transport) {
+            Ok(value) => return Ok(value),
+            Err(error) if error.is::<ConnectionLost>() => {
+                log::warn!("FTP connection lost (attempt {attempt}): {error}");
+                transport.disconnect();
+                last_error = Some(error);
+            }
+            /* Anything else is a decision of the server, which retrying would not change */
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.expect("at least one attempt must have failed"))
+}
+
 /// A single entry of a directory listing
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DirEntry {

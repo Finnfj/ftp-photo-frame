@@ -9,8 +9,8 @@ use crate::{
     api_client::{ApiClient, LoginError, PhotoNotFound, SortBy},
     cli::SourceSize,
     ftp::{
-        ConnectionLost, Credentials, EntryKind, FtpAddress, FtpTransport, InvalidFtpResponse,
-        check_tls_supported, validate_path,
+        Credentials, EntryKind, FtpAddress, FtpTransport, InvalidFtpResponse, check_tls_supported,
+        validate_path, with_reconnect,
     },
     http::Url,
     metadata::{Location, Metadata},
@@ -25,10 +25,6 @@ const EXCLUDED_DIRECTORIES: [&str; 1] = ["@eaDir"];
 
 /// Bounds how deep the traversal descends, in case of a deeply nested or unexpectedly large tree
 const MAX_DEPTH: usize = 16;
-
-/// One reconnect is enough to recover from the far most common failure: the server dropping an idle
-/// session between two photos
-const MAX_ATTEMPTS: usize = 2;
 
 const ANONYMOUS_USER: &str = "anonymous";
 
@@ -127,31 +123,13 @@ impl<T: FtpTransport> FtpApiClient<T> {
         Ok(photos)
     }
 
-    /// Runs an operation, reconnecting and retrying it once if the connection turned out to be dead
-    fn with_reconnect<R>(&self, mut operation: impl FnMut(&mut T) -> Result<R>) -> Result<R> {
-        let mut last_error = None;
-        for attempt in 1..=MAX_ATTEMPTS {
-            let mut transport = self.transport.borrow_mut();
-            if !transport.is_connected()
-                && let Err(error) = transport.connect(&self.address, &self.credentials)
-            {
-                log::warn!("Cannot connect to the FTP server (attempt {attempt}): {error}");
-                transport.disconnect();
-                last_error = Some(error);
-                continue;
-            }
-            match operation(&mut transport) {
-                Ok(value) => return Ok(value),
-                Err(error) if error.is::<ConnectionLost>() => {
-                    log::warn!("FTP connection lost (attempt {attempt}): {error}");
-                    transport.disconnect();
-                    last_error = Some(error);
-                }
-                /* Anything else is a decision of the server, which retrying would not change */
-                Err(error) => return Err(error),
-            }
-        }
-        Err(last_error.expect("at least one attempt must have failed"))
+    /// Runs an operation, reconnecting and retrying it once if the connection turned out to be
+    /// dead. The retry itself lives in [crate::ftp::with_reconnect].
+    fn with_reconnect<R>(&self, operation: impl FnMut(&mut T) -> Result<R>) -> Result<R> {
+        /* Borrowed for the whole retry rather than per attempt, which is the one place the
+         * "borrowed in exactly one place" invariant of the transport field is upheld */
+        let mut transport = self.transport.borrow_mut();
+        with_reconnect(&mut *transport, &self.address, &self.credentials, operation)
     }
 
     /// [ApiClient::get_exif] does not receive the photo's bytes, and [crate::slideshow::Slideshow]
@@ -406,7 +384,7 @@ mod tests {
     use mockall::{Sequence, predicate::eq};
     use suppaftp::Status;
 
-    use crate::ftp::{DirEntry, MockFtpTransport};
+    use crate::ftp::{ConnectionLost, DirEntry, MAX_ATTEMPTS, MockFtpTransport};
 
     const SHARE_LINK: &str = "ftp://joe@fake.nas/Photos";
 
