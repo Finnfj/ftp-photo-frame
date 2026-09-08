@@ -41,6 +41,31 @@ pub trait FtpTransport {
     /// Downloads a file in binary mode
     fn retrieve(&mut self, path: &str) -> Result<Bytes>;
 
+    /// Uploads a file in binary mode, reading it from `source`, and answers with the number of
+    /// bytes the server accepted.
+    ///
+    /// Takes a reader rather than a buffer so that a photo on its way from the web app to the
+    /// server never has to be held in memory in full, which matters on a Raspberry Pi Zero. The
+    /// count is what lets the caller notice a transfer that ended early.
+    #[cfg(feature = "web")]
+    fn store(&mut self, path: &str, source: &mut dyn std::io::Read) -> Result<u64>;
+
+    /// Renames a file. Both paths are absolute on the server.
+    #[cfg(feature = "web")]
+    fn rename(&mut self, from: &str, to: &str) -> Result<()>;
+
+    /// Deletes a single file
+    #[cfg(feature = "web")]
+    fn delete_file(&mut self, path: &str) -> Result<()>;
+
+    /// Creates a single directory, whose parent has to exist already
+    #[cfg(feature = "web")]
+    fn create_directory(&mut self, path: &str) -> Result<()>;
+
+    /// Deletes a directory, which every server refuses unless it is empty
+    #[cfg(feature = "web")]
+    fn delete_directory(&mut self, path: &str) -> Result<()>;
+
     /// Closes the connection, ignoring any error while doing so
     fn disconnect(&mut self);
 }
@@ -51,8 +76,8 @@ pub(crate) const MAX_ATTEMPTS: usize = 2;
 
 /// Runs an operation, reconnecting and retrying it once if the connection turned out to be dead.
 ///
-/// A free function rather than a method, so that anything holding its own session can share it:
-/// an FTP session is stateful and cannot be handed around.
+/// Shared by [crate::api_client::ftp_client::FtpApiClient] and the web app, which hold separate
+/// sessions to the same server because an FTP session is stateful and cannot be shared.
 ///
 /// Only for operations that can be repeated without consequence. An upload cannot: its source has
 /// already been consumed by the time the first attempt fails, so a second one would store an empty
@@ -85,6 +110,16 @@ pub fn with_reconnect<T: FtpTransport, R>(
         }
     }
     Err(last_error.expect("at least one attempt must have failed"))
+}
+
+/// Everything needed to open a session, so that the web app can open a second, independent one to
+/// the directory the slideshow reads from
+#[derive(Clone, Debug)]
+pub struct FtpSession {
+    pub address: FtpAddress,
+    pub credentials: Credentials,
+    /// Absolute path of the directory the share link points at
+    pub root: String,
 }
 
 /// A single entry of a directory listing
@@ -282,6 +317,36 @@ impl FtpTransport for SuppaFtpTransport {
         Ok(Bytes::from(file.into_inner()))
     }
 
+    /* Like RETR, these all take the remainder of the command line as the path, so an absolute one
+     * with spaces in it passes through unchanged */
+
+    #[cfg(feature = "web")]
+    fn store(&mut self, path: &str, mut source: &mut dyn std::io::Read) -> Result<u64> {
+        self.stream_mut()?
+            .put_file(path, &mut source)
+            .map_err(map_error)
+    }
+
+    #[cfg(feature = "web")]
+    fn rename(&mut self, from: &str, to: &str) -> Result<()> {
+        self.stream_mut()?.rename(from, to).map_err(map_error)
+    }
+
+    #[cfg(feature = "web")]
+    fn delete_file(&mut self, path: &str) -> Result<()> {
+        self.stream_mut()?.rm(path).map_err(map_error)
+    }
+
+    #[cfg(feature = "web")]
+    fn create_directory(&mut self, path: &str) -> Result<()> {
+        self.stream_mut()?.mkdir(path).map_err(map_error)
+    }
+
+    #[cfg(feature = "web")]
+    fn delete_directory(&mut self, path: &str) -> Result<()> {
+        self.stream_mut()?.rmdir(path).map_err(map_error)
+    }
+
     fn disconnect(&mut self) {
         if let Some(mut stream) = self.stream.take()
             && let Err(error) = stream.quit()
@@ -361,7 +426,13 @@ fn map_error(error: FtpError) -> anyhow::Error {
     let kind = match &error {
         FtpError::ConnectionError(_) | FtpError::BadResponse => Kind::ConnectionLost,
         FtpError::UnexpectedResponse(response) => match response.status {
-            /* The server is shutting down or timed the session out */
+            /* The server is shutting down or timed the session out.
+             *
+             * A server that limits how many sessions one account may hold answers the same way
+             * when the limit is reached, and then reconnecting cannot help. That is why
+             * with_reconnect gives up after MAX_ATTEMPTS instead of looping: two sessions to the
+             * same account exist as soon as the web app is used, and hammering the control port
+             * is what trips a NAS into blocking the frame's address altogether. */
             Status::NotAvailable => Kind::ConnectionLost,
             status => Kind::InvalidResponse(
                 status,

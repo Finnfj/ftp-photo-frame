@@ -2,7 +2,7 @@
 
 pub use clap::Parser;
 
-use std::{path::PathBuf, time::Duration};
+use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 use anyhow::{Result, bail};
 use clap::{ValueEnum, builder::TypedValueParser as _};
@@ -139,7 +139,61 @@ pub struct Cli {
     /// Disable checking for updates during startup
     #[arg(long, default_value_t = false)]
     pub disable_update_check: bool,
+
+    /// Enable the web app for managing the photos, protected by this password
+    ///
+    /// The frame then serves a page that can be opened from a phone or a laptop on the same
+    /// network to browse, upload and delete photos. Log in with the user name set by --web-user.
+    /// Only the FTP backend supports this, as a Synology or Immich share link offers no way to
+    /// change what is in the album. The connection is not encrypted, so only use it on a network
+    /// you trust. Prefer the environment variable: a password given on the command line is visible
+    /// to other users of this machine in the process list
+    #[arg(
+        long = "web-password",
+        value_name = "PASSWORD",
+        env = "SYNO_PHOTO_FRAME_WEB_PASSWORD",
+        hide_env_values = true,
+        value_parser = try_parse_web_password)]
+    pub web_password: Option<String>,
+
+    /// User name for logging into the web app. Requires --web-password
+    #[arg(
+        long = "web-user",
+        value_name = "USER",
+        default_value = "frame",
+        requires = "web_password"
+    )]
+    pub web_user: String,
+
+    /// Address and port the web app listens on. Requires --web-password
+    ///
+    /// Defaults to every network interface of this machine, which is what makes the frame
+    /// reachable from a phone. Use 127.0.0.1:8080 to restrict it to this machine
+    #[arg(
+        long = "web-bind",
+        value_name = "ADDRESS:PORT",
+        default_value = "0.0.0.0:8080",
+        requires = "web_password"
+    )]
+    pub web_bind: SocketAddr,
 }
+
+fn try_parse_web_password(arg: &str) -> Result<String> {
+    /* Refused rather than warned about: a typo must not be able to leave the web app open to
+     * everybody on the network */
+    if arg.is_empty() {
+        bail!("must not be empty")
+    }
+    if arg.chars().count() < MIN_SENSIBLE_PASSWORD_LENGTH {
+        /* Only a warning, because it is the user's frame on the user's network */
+        log::warn!(
+            "The web app password is shorter than {MIN_SENSIBLE_PASSWORD_LENGTH} characters"
+        );
+    }
+    Ok(arg.to_string())
+}
+
+const MIN_SENSIBLE_PASSWORD_LENGTH: usize = 8;
 
 fn try_parse_duration(arg: &str) -> Result<Duration> {
     let seconds = arg.parse()?;
@@ -239,8 +293,51 @@ pub enum SourceSize {
     L,
 }
 
-#[test]
-fn verify_cli() {
-    use clap::CommandFactory;
-    Cli::command().debug_assert()
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SHARE_LINK: &str = "ftp://user@host/Photos";
+
+    #[test]
+    fn verify_cli() {
+        use clap::CommandFactory;
+        Cli::command().debug_assert()
+    }
+
+    #[test]
+    fn the_web_app_is_off_unless_a_password_is_given() {
+        let cli = Cli::try_parse_from(["syno-photo-frame", SHARE_LINK]).unwrap();
+
+        assert_eq!(cli.web_password, None);
+    }
+
+    #[test]
+    fn web_user_and_web_bind_require_a_password() {
+        /* Their defaults must not make --web-password mandatory, while stating either of them
+         * without one is a mistake worth reporting rather than silently ignoring */
+        for argument in ["--web-user=someone", "--web-bind=127.0.0.1:9000"] {
+            assert!(
+                Cli::try_parse_from(["syno-photo-frame", SHARE_LINK, argument]).is_err(),
+                "argument was {argument}"
+            );
+            assert!(
+                Cli::try_parse_from([
+                    "syno-photo-frame",
+                    SHARE_LINK,
+                    argument,
+                    "--web-password=hunter2hunter2",
+                ])
+                .is_ok(),
+                "argument was {argument}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_web_password_is_refused() {
+        let result = Cli::try_parse_from(["syno-photo-frame", SHARE_LINK, "--web-password="]);
+
+        assert!(result.is_err());
+    }
 }

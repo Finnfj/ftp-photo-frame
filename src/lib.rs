@@ -34,7 +34,7 @@ use crate::{
     metadata::FromEnv,
     rand::Random,
     sdl::{Sdl, TextureIndex},
-    slideshow::Slideshow,
+    slideshow::{Refresh, Slideshow},
     standby::{DisplayState, Standby},
     update::UpdateNotification,
 };
@@ -58,6 +58,8 @@ mod rand;
 mod slideshow;
 mod transition;
 mod update;
+#[cfg(feature = "web")]
+mod web;
 
 #[cfg(test)]
 mod test_helpers;
@@ -146,6 +148,14 @@ where
     } else {
         cli.backend
     };
+    if cli.web_password.is_some() && !matches!(backend, Backend::Ftp) {
+        /* Reported before anything starts rather than ignored, the way an ftps:// link is on a
+         * build without FTPS support */
+        bail!(
+            "--web-password is only supported by the FTP backend: a Synology or Immich share link \
+             gives no way to change what is in the album."
+        )
+    }
     match backend {
         Backend::Synology => slideshow_loop(
             cli,
@@ -157,6 +167,7 @@ where
             current_image,
             env,
             standby,
+            None,
         ),
         Backend::Immich => slideshow_loop(
             cli,
@@ -167,23 +178,69 @@ where
             current_image,
             env,
             standby,
+            None,
         ),
-        Backend::Ftp => slideshow_loop(
-            cli,
-            FtpApiClient::build(
+        Backend::Ftp => {
+            let api_client = FtpApiClient::build(
                 SuppaFtpTransport::new(Duration::from_secs(cli.timeout_seconds.into())),
                 &cli.share_link,
             )?
-            .with_password(&cli.password),
-            sdl,
-            random,
-            update_check_receiver,
-            current_image,
-            env,
-            standby,
-        ),
+            .with_password(&cli.password);
+            let refresh = start_web_app(cli, &api_client)?;
+            slideshow_loop(
+                cli,
+                api_client,
+                sdl,
+                random,
+                update_check_receiver,
+                current_image,
+                env,
+                standby,
+                refresh,
+            )
+        }
         Backend::Auto => unreachable!(),
     }
+}
+
+/// Starts serving the web app, and hands back the handle the slideshow watches for changes made
+/// through it. [None] when no `--web-password` was given, which is what switches the web app off.
+#[cfg(feature = "web")]
+fn start_web_app<T: crate::ftp::FtpTransport>(
+    cli: &Cli,
+    api_client: &FtpApiClient<T>,
+) -> Result<Option<Refresh>> {
+    let Some(password) = &cli.web_password else {
+        return Ok(None);
+    };
+    let server = web::bind(cli.web_bind)?;
+    let refresh = Refresh::default();
+    let config = web::routes::WebConfig {
+        user: cli.web_user.clone(),
+        password: password.clone(),
+        bind: cli.web_bind,
+    };
+    /* Its own session, because an FTP session is stateful and this client is about to be moved
+     * into the photo fetching thread */
+    let state = web::state(
+        config,
+        api_client.session(),
+        Duration::from_secs(cli.timeout_seconds.into()),
+        refresh.clone(),
+    );
+    thread::spawn(move || web::serve(server, state));
+    Ok(Some(refresh))
+}
+
+#[cfg(not(feature = "web"))]
+fn start_web_app<T>(cli: &Cli, _: &FtpApiClient<T>) -> Result<Option<Refresh>> {
+    if cli.web_password.is_some() {
+        bail!(
+            "--web-password requires a build with web app support. Reinstall with \
+             `cargo install syno-photo-frame --features web`."
+        )
+    }
+    Ok(None)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -196,6 +253,7 @@ fn slideshow_loop<A, R>(
     mut current_image: DynamicImage,
     env: &impl Env,
     mut standby: Standby,
+    refresh: Option<Refresh>,
 ) -> Result<()>
 where
     A: ApiClient + Send,
@@ -216,6 +274,7 @@ where
             thread_scope,
             photo_sender,
             env,
+            refresh,
         )?;
 
         let loop_result = loop {
@@ -280,6 +339,7 @@ where
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn photo_fetcher_thread<'a, A, R>(
     cli: &'a Cli,
     api_client: A,
@@ -288,6 +348,7 @@ fn photo_fetcher_thread<'a, A, R>(
     thread_scope: &'a Scope<'a, '_>,
     photo_sender: SyncSender<Result<DynamicImagePhoto>>,
     env: &impl Env,
+    refresh: Option<Refresh>,
 ) -> Result<ScopedJoinHandle<'a, ()>>
 where
     A: ApiClient + Send + 'a,
@@ -304,7 +365,8 @@ where
     )
     .with_ordering(cli.order)
     .with_random_start(cli.random_start)
-    .with_source_size(cli.source_size);
+    .with_source_size(cli.source_size)
+    .with_refresh(refresh);
     Ok(thread_scope.spawn(move || {
         loop {
             let photo_result = slideshow.get_next_photo().and_then(|photo| {
@@ -697,6 +759,34 @@ mod tests {
          * observe it here as the error type would be different from Quit */
         assert!(result.is_err_and(|e| e.is::<QuitEvent>()));
         client_stub.checkpoint();
+    }
+
+    /// Ignoring the option would leave somebody wondering why the page never appears, so it is
+    /// reported the way an ftps:// link on a build without FTPS support is
+    #[test]
+    fn when_the_backend_is_not_ftp_then_the_web_password_is_rejected() {
+        let mut sdl_stub = MockSdl::new().with_default_expectations();
+        sdl_stub.expect_handle_quit_event().returning(|| Ok(()));
+        let cli_command = "syno-photo-frame http://fake.dsm.addr/aa/sharing/FakeSharingId \
+             --disable-update-check \
+             --splash assets/test_loading.jpeg \
+             --web-password hunter2hunter2";
+
+        let result = run(
+            &Cli::parse_from(cli_command.split_whitespace()),
+            (&MockHttpClient::new(), &Jar::default()),
+            &mut sdl_stub,
+            FakeRandom::default(),
+            "1.2.3",
+            &MockEnv::default(),
+            Standby::disabled(),
+        );
+
+        let error = result.expect_err("the option has no meaning for a Synology album");
+        assert!(
+            error.to_string().contains("--web-password"),
+            "the message has to name the option, was {error}"
+        );
     }
 
     /// Standby has to pause the slideshow rather than let it run against a switched off display,

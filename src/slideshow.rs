@@ -1,4 +1,10 @@
-use std::time::Duration;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 #[cfg(test)]
 use crate::test_helpers::fake_sleep as thread_sleep;
@@ -16,6 +22,28 @@ use crate::{
     rand::Random,
 };
 
+/// Tells the slideshow that what it is showing has changed on the server.
+///
+/// The display sequence is otherwise only rebuilt once it has run out, which for a large album is
+/// hours. A photo uploaded from the web app has to appear long before that, or uploading it was
+/// pointless.
+#[derive(Clone, Debug, Default)]
+pub struct Refresh(Arc<AtomicBool>);
+
+impl Refresh {
+    /// Asks for the sequence to be rebuilt from a fresh listing. Only the web app changes the
+    /// album, so without it there is nothing to ask for.
+    #[cfg(any(feature = "web", test))]
+    pub fn request(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+
+    /// True at most once per [Refresh::request], so that one change rebuilds the sequence once
+    pub fn take(&self) -> bool {
+        self.0.swap(false, Ordering::Relaxed)
+    }
+}
+
 /// Holds the slideshow state and queries API to fetch photos.
 #[derive(Debug)]
 pub struct Slideshow<A: ApiClient, R> {
@@ -29,6 +57,8 @@ pub struct Slideshow<A: ApiClient, R> {
     /// Defines formatting of date for info box
     locale: Locale,
     format: String,
+    /// [None] unless the web app is running, as it is the only thing that changes the album
+    refresh: Option<Refresh>,
 }
 
 impl<A: ApiClient, R: Random> Slideshow<A, R> {
@@ -42,6 +72,7 @@ impl<A: ApiClient, R: Random> Slideshow<A, R> {
             source_size: SourceSize::L,
             locale,
             format: format.unwrap_or("%x").to_string(),
+            refresh: None,
         }
     }
 
@@ -60,11 +91,23 @@ impl<A: ApiClient, R: Random> Slideshow<A, R> {
         self
     }
 
+    pub fn with_refresh(mut self, refresh: Option<Refresh>) -> Self {
+        self.refresh = refresh;
+        self
+    }
+
     pub fn get_next_photo(&mut self) -> Result<BytesPhoto> {
         const LOOP_SLEEP_DURATION: Duration = Duration::from_secs(1);
         /* Loop here prevents display of error screen when the photo has simply been removed from
          * the album since we fetched its metadata. */
         loop {
+            if self.refresh.as_ref().is_some_and(Refresh::take) {
+                /* What is left of the sequence predates the change, so it is dropped and rebuilt
+                 * from a fresh listing. This restarts the round, which is the point: the photo
+                 * somebody just uploaded should show up now rather than in a few hours. */
+                log::info!("The album changed, rebuilding the display sequence");
+                self.photo_display_sequence.clear();
+            }
             if self.slideshow_ended() {
                 self.initialize()?;
             }
@@ -167,7 +210,7 @@ mod tests {
             ftp_client::{FtpApiClient, FtpPhoto},
             syno_client::SynoApiClient,
         },
-        ftp::{InvalidFtpResponse, MockFtpTransport},
+        ftp::{DirEntry, EntryKind, InvalidFtpResponse, MockFtpTransport},
         http::{CookieStore, HttpClient, Jar, MockHttpResponse, StatusCode, Url},
         test_helpers::rand::FakeRandom,
         test_helpers::{self, MockHttpClient},
@@ -748,6 +791,73 @@ mod tests {
             vec![new_ftp_photo("after_next.jpg")],
             "the missing photo must be skipped rather than displayed as an error"
         );
+    }
+
+    /// Without this, a photo uploaded through the web app would only be shown once the current
+    /// round has run out, which for a large album is hours away
+    #[test]
+    fn get_next_photo_rebuilds_the_sequence_when_a_refresh_was_requested() {
+        let mut transport = MockFtpTransport::new();
+        transport.expect_is_connected().return_const(true);
+        transport.expect_list_dir().return_once(|_| {
+            Ok(vec![DirEntry {
+                name: "uploaded.jpg".to_string(),
+                kind: EntryKind::File,
+                modified: None,
+            }])
+        });
+        transport
+            .expect_retrieve()
+            .with(eq("/Photos/uploaded.jpg"))
+            .return_once(|_| Ok(Bytes::from_static(&[42])));
+        let refresh = Refresh::default();
+        let mut slideshow =
+            new_ftp_slideshow(transport, FakeRandom::default()).with_refresh(Some(refresh.clone()));
+        slideshow.photo_display_sequence = vec![new_ftp_photo("stale.jpg")];
+
+        refresh.request();
+        let result = slideshow.get_next_photo();
+
+        assert_eq!(
+            result.unwrap().bytes,
+            Bytes::from_static(&[42]),
+            "the photo left over from before the change must not be displayed"
+        );
+    }
+
+    #[test]
+    fn get_next_photo_rebuilds_the_sequence_only_once_per_change() {
+        let mut transport = MockFtpTransport::new();
+        transport.expect_is_connected().return_const(true);
+        transport
+            .expect_list_dir()
+            /* A second listing would mean the request was not cleared, and the slideshow would
+             * restart its round for every single photo */
+            .times(1)
+            .return_once(|_| {
+                Ok(vec![
+                    DirEntry {
+                        name: "a.jpg".to_string(),
+                        kind: EntryKind::File,
+                        modified: None,
+                    },
+                    DirEntry {
+                        name: "b.jpg".to_string(),
+                        kind: EntryKind::File,
+                        modified: None,
+                    },
+                ])
+            });
+        transport
+            .expect_retrieve()
+            .returning(|_| Ok(Bytes::from_static(&[42])));
+        let refresh = Refresh::default();
+        let mut slideshow =
+            new_ftp_slideshow(transport, FakeRandom::default()).with_refresh(Some(refresh.clone()));
+
+        refresh.request();
+        slideshow.get_next_photo().unwrap();
+        slideshow.get_next_photo().unwrap();
     }
 
     /// The mock is owned by the client, so its expectations are verified when the slideshow is

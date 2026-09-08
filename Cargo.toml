@@ -31,11 +31,13 @@ default = []
 ftps = ["dep:rustls", "dep:rustls-platform-verifier", "suppaftp/rustls-aws-lc-rs"]
 # Support for a motion sensor switching the display off, see --motion-sensor-gpio
 motion-sensor = ["dep:rppal"]
+# Local network web app for managing the photos on the FTP server, see --web-password
+web = ["dep:tiny_http", "dep:base64", "dep:subtle", "dep:url"]
 
 [dependencies]
 anyhow = "1.*"
 bytes = "1.*"
-clap = { version = "4.*", features = ["derive", "wrap_help"] }
+clap = { version = "4.*", features = ["derive", "env", "wrap_help"] }
 chrono = { version = "0.4.*", features = ["serde", "unstable-locales"] }
 fast_image_resize = { version = "5.*", features = ["image"] }
 image = { version = "0.25.*", default-features = false, features = ["jpeg", "png"] }
@@ -53,6 +55,12 @@ syno_api = "0.6"
 suppaftp = { version = "10", default-features = false }
 percent-encoding = "2.3.2"
 kamadak-exif = "0.6.1"
+# Web app. Deliberately without tiny_http's TLS features, which pin an older rustls than the one
+# the "ftps" feature uses; the web app is plain HTTP on the local network.
+tiny_http = { version = "0.12.*", optional = true, default-features = false }
+base64 = { version = "0.22.*", optional = true }
+subtle = { version = "2.6.*", optional = true }
+url = { version = "2.5.*", optional = true }
 
 # Raspberry Pi GPIO access, needed by the optional motion sensor support
 [target.'cfg(target_os = "linux")'.dependencies]
