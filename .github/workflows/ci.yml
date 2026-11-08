@@ -34,6 +34,11 @@ jobs:
       # in dependencies and invalidate the cache
       - run: cargo clippy --locked --all-targets --all-features -- --deny warnings
 
+      # Every check above passes --all-features, so nothing here would ever compile the
+      # #[cfg(not(feature = "web"))] arms -- and the default feature set is exactly what the
+      # Debian package ships, since dpkg/Makefile runs a bare `cargo build --release`.
+      - run: cargo clippy --locked --all-targets -- --deny warnings
+
       - run: cargo test --locked --all-features
 
   build:
