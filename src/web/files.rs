@@ -17,13 +17,22 @@ use percent_encoding::percent_decode_str;
 use rand::{RngExt, rng};
 
 use crate::{
-    api_client::ftp_client::{EXCLUDED_DIRECTORIES, MAX_DEPTH, PHOTO_EXTENSIONS, is_photo},
+    api_client::ftp_client::{EXCLUDED_DIRECTORIES, PHOTO_EXTENSIONS, is_photo},
     ftp::{EntryKind, FtpSession, FtpTransport, validate_path, with_reconnect},
     slideshow::Refresh,
 };
 
 /// Bounds a path so that a request cannot make the program build an arbitrarily long FTP command
 const MAX_PATH_LENGTH: usize = 1024;
+
+/// Bounds how many parts a path coming from the browser may be made of.
+///
+/// Deliberately a constant of its own rather than the traversal's `MAX_DEPTH`, which the two
+/// shared until it became unclear which of the two meanings a given use carried. They are
+/// different measurements that happen to agree on a number: this counts the parts of one path,
+/// the file name among them, while `MAX_DEPTH` counts the levels the album traversal has
+/// descended below the root. Changing one should not silently change the other.
+const MAX_PATH_SEGMENTS: usize = 16;
 
 /// Most servers stop at 255 bytes, and a name that long is a mistake rather than a wish
 const MAX_NAME_LENGTH: usize = 255;
@@ -312,9 +321,9 @@ fn resolve(root: &str, relative: &str) -> Result<String> {
     }
 
     let segments: Vec<&str> = relative.split('/').collect();
-    if segments.len() > MAX_DEPTH {
+    if segments.len() > MAX_PATH_SEGMENTS {
         bail!(PathRejected(format!(
-            "Paths must not be deeper than {MAX_DEPTH} directories"
+            "Paths must not be made of more than {MAX_PATH_SEGMENTS} parts"
         )))
     }
     for segment in &segments {
@@ -609,11 +618,11 @@ mod tests {
     }
 
     #[test]
-    fn resolve_rejects_a_path_deeper_than_the_traversal_limit() {
-        let deep = vec!["a"; MAX_DEPTH + 1].join("/");
+    fn resolve_rejects_a_path_made_of_too_many_parts() {
+        let deep = vec!["a"; MAX_PATH_SEGMENTS + 1].join("/");
 
         assert!(resolve(ROOT, &deep).is_err());
-        assert!(resolve(ROOT, &vec!["a"; MAX_DEPTH].join("/")).is_ok());
+        assert!(resolve(ROOT, &vec!["a"; MAX_PATH_SEGMENTS].join("/")).is_ok());
     }
 
     #[test]
