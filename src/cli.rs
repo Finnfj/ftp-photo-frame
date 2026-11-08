@@ -147,7 +147,8 @@ pub struct Cli {
     /// Only the FTP backend supports this, as a Synology or Immich share link offers no way to
     /// change what is in the album. The connection is not encrypted, so only use it on a network
     /// you trust. Prefer the environment variable: a password given on the command line is visible
-    /// to other users of this machine in the process list
+    /// to other users of this machine in the process list. Requires a build with the "web" feature
+    /// enabled, which the Debian package does not have
     #[arg(
         long = "web-password",
         value_name = "PASSWORD",
