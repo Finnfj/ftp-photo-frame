@@ -174,11 +174,13 @@ the process list; when the frame is started by systemd, an
 `Environment=` line in the unit file is the better place for it. Use
 `--web-bind` to change the address and port.
 
-A photo uploaded this way appears on the frame within one
-`--interval` rather than only after the current round through the album
-has finished. Note that this restarts the round, so with `--order
-by-date` the slideshow returns to the oldest photo, and with `--order
-random` the photos are shuffled again.
+A photo uploaded this way does not wait for the current round through
+the album to finish: the display sequence is rebuilt from a fresh
+listing as soon as the upload lands. One photo has usually already been
+fetched ahead of the one on screen, so the new photo appears within two
+`--interval`s rather than one. Note that rebuilding restarts the round,
+so with `--order by-date` the slideshow returns to the oldest photo,
+and with `--order random` the photos are shuffled again.
 
 ##### Limitations
 
@@ -198,7 +200,15 @@ random` the photos are shuffled again.
   is slow, as every photo has to be downloaded once, and they are
   rendered again after a restart
 * A photo deleted while it is on screen stays there until the next one
-  is due
+  is due. The rest of the round is rebuilt immediately, so it does not
+  come round again
+* A single upload is limited to 64 MB
+* The page is only reachable by IP address, by `localhost`, or by a
+  `.local` name, and only on the port the frame listens on. Reaching it
+  under any other name -- a DNS name you registered for it, or a
+  reverse proxy on a different port -- is refused with status 421. This
+  is deliberate: it is what stops a page you happen to be visiting
+  elsewhere from quietly making requests to the frame on your network
 
 ### Raspberry Pi
 
