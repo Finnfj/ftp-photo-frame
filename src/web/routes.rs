@@ -240,8 +240,14 @@ pub fn handle<T: FtpTransport>(
         }),
 
         (Some(Method::Post), "/api/rmdir") => guarded(request, || {
-            match state.files.delete_directory(&raw(&url, "path")) {
-                Ok(()) => Response::no_content(),
+            let path = raw(&url, "path");
+            match state.files.delete_directory(&path) {
+                Ok(()) => {
+                    /* The directory was empty, but its photos' previews may still be cached from
+                     * before they were deleted, and the name can come back */
+                    state.thumbnails.forget_under(&path);
+                    Response::no_content()
+                }
                 Err(error) => failed(error),
             }
         }),

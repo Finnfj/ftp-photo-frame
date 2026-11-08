@@ -208,7 +208,11 @@ impl<T: FtpTransport> FtpFiles<T> {
 
     pub fn delete_photo(&self, photo: &str) -> Result<()> {
         let path = resolve_photo(&self.session.root, photo)?;
-        self.retrying(|transport| transport.delete_file(&path))
+        self.retrying(|transport| transport.delete_file(&path))?;
+        /* The rest of the round still lists the deleted photo, and the slideshow burns a second on
+         * PhotoNotFound every time it reaches it. Rebuilding costs one listing and ends that. */
+        self.refresh.request();
+        Ok(())
     }
 
     /// Creates a directory and answers with its name, which is the one asked for or an error
@@ -231,7 +235,10 @@ impl<T: FtpTransport> FtpFiles<T> {
         }
         let path = resolve(&self.session.root, directory)?;
         self.retrying(|transport| transport.delete_directory(&path))
-            .map_err(directory_not_empty)
+            .map_err(directory_not_empty)?;
+        /* Only empty directories can go, so nothing the slideshow is showing disappeared with it.
+         * The listing the web app shows did change, but that is the browser's copy, not ours. */
+        Ok(())
     }
 
     /// Runs an operation that can be repeated without consequence, reconnecting once if the
@@ -1003,6 +1010,35 @@ mod tests {
     }
 
     #[test]
+    fn delete_photo_requests_a_slideshow_refresh() {
+        let mut transport = connected();
+        transport.expect_delete_file().return_once(|_| Ok(()));
+        let refresh = Refresh::default();
+        let files = files(transport).with_refresh(refresh.clone());
+
+        files.delete_photo("summer/IMG_1234.jpg").unwrap();
+
+        assert!(
+            refresh.take(),
+            "the rest of the round still lists the deleted photo, and stalls a second on each"
+        );
+    }
+
+    #[test]
+    fn a_failed_delete_does_not_request_a_refresh() {
+        let mut transport = connected();
+        transport
+            .expect_delete_file()
+            .return_once(|_| Err(anyhow!("no")));
+        let refresh = Refresh::default();
+        let files = files(transport).with_refresh(refresh.clone());
+
+        let _ = files.delete_photo("summer/IMG_1234.jpg");
+
+        assert!(!refresh.take());
+    }
+
+    #[test]
     fn create_directory_creates_it_below_the_resolved_parent() {
         let mut transport = connected();
         transport
@@ -1025,6 +1061,21 @@ mod tests {
         let result = files(transport).delete_directory("");
 
         assert!(result.is_err_and(|error| error.is::<PathRejected>()));
+    }
+
+    #[test]
+    fn delete_directory_does_not_request_a_refresh() {
+        let mut transport = connected();
+        transport.expect_delete_directory().return_once(|_| Ok(()));
+        let refresh = Refresh::default();
+        let files = files(transport).with_refresh(refresh.clone());
+
+        files.delete_directory("summer").unwrap();
+
+        assert!(
+            !refresh.take(),
+            "only empty directories can go, so the display sequence cannot have held anything in it"
+        );
     }
 
     #[test]

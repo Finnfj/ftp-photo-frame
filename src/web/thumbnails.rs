@@ -56,10 +56,18 @@ impl Thumbnails {
 
     /// Drops the preview of a photo that is gone.
     ///
-    /// Nothing else has to invalidate an entry: an upload never overwrites, it picks a free name,
-    /// so the bytes behind a path do not change while the frame is running.
+    /// An upload never overwrites, it picks a free name, so the bytes behind a path do not change
+    /// on their own. A path can still be *reused*: delete a directory, create one with the same
+    /// name, upload a photo whose name was seen before, and the old preview would be served for
+    /// the new photo. Deletion is therefore the one thing that has to invalidate, and it has to
+    /// invalidate whole subtrees, not just the photo named.
     pub fn forget(&self, key: &str) {
         self.lock().remove(key);
+    }
+
+    /// Drops the previews of everything that was under a directory that is gone.
+    pub fn forget_under(&self, directory: &str) {
+        self.lock().remove_under(&format!("{directory}/"));
     }
 
     fn lock(&self) -> MutexGuard<'_, Cache> {
@@ -116,6 +124,18 @@ impl Cache {
         {
             self.used -= removed.len();
         }
+    }
+
+    fn remove_under(&mut self, prefix: &str) {
+        let mut freed = 0;
+        self.entries.retain(|(stored, bytes)| {
+            let keep = !stored.starts_with(prefix);
+            if !keep {
+                freed += bytes.len();
+            }
+            keep
+        });
+        self.used -= freed;
     }
 }
 
@@ -351,5 +371,51 @@ mod tests {
         cache.insert("a".to_string(), Bytes::from_static(b"12345"));
 
         assert_eq!(cache.used, 5);
+    }
+
+    #[test]
+    fn forget_under_drops_every_preview_below_the_directory() {
+        let thumbnails = Thumbnails::new(1024 * 1024);
+        let load = || Ok(Bytes::from_static(TEST_JPEG));
+        thumbnails.get("summer/a.jpg", load).unwrap();
+        thumbnails.get("summer/beach/b.jpg", load).unwrap();
+        thumbnails.get("winter/c.jpg", load).unwrap();
+
+        thumbnails.forget_under("summer");
+
+        let mut cache = thumbnails.lock();
+        assert!(cache.take_recent("summer/a.jpg").is_none());
+        assert!(cache.take_recent("summer/beach/b.jpg").is_none());
+        assert!(
+            cache.take_recent("winter/c.jpg").is_some(),
+            "another directory must not be touched"
+        );
+    }
+
+    #[test]
+    fn forget_under_leaves_a_directory_whose_name_only_starts_the_same() {
+        let mut cache = Cache::new(100);
+        cache.insert("summer/a.jpg".to_string(), Bytes::from_static(b"12345"));
+        cache.insert("summertime/b.jpg".to_string(), Bytes::from_static(b"12345"));
+
+        cache.remove_under("summer/");
+
+        assert!(cache.take_recent("summer/a.jpg").is_none());
+        assert!(
+            cache.take_recent("summertime/b.jpg").is_some(),
+            "the prefix has to end at a directory boundary"
+        );
+    }
+
+    #[test]
+    fn forget_under_gives_the_budget_back() {
+        let mut cache = Cache::new(100);
+        cache.insert("summer/a.jpg".to_string(), Bytes::from_static(b"12345"));
+        cache.insert("summer/b.jpg".to_string(), Bytes::from_static(b"12345"));
+        cache.insert("winter/c.jpg".to_string(), Bytes::from_static(b"12345"));
+
+        cache.remove_under("summer/");
+
+        assert_eq!(cache.used, 5, "the two dropped previews were still counted");
     }
 }
