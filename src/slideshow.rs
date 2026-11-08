@@ -1,4 +1,5 @@
 use std::{
+    fmt,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -44,6 +45,23 @@ impl Refresh {
     }
 }
 
+/// The album has no photos in it at all.
+///
+/// On its own this is fatal, and deliberately so: a share link pointing at the wrong place is a
+/// mistake worth reporting straight away rather than leaving somebody in front of a blank frame.
+/// It is only survivable while the web app is running, because only then is there a way to put a
+/// photo back without walking over to the machine.
+#[derive(Debug)]
+pub struct AlbumEmpty;
+
+impl fmt::Display for AlbumEmpty {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Album is empty")
+    }
+}
+
+impl std::error::Error for AlbumEmpty {}
+
 /// Holds the slideshow state and queries API to fetch photos.
 #[derive(Debug)]
 pub struct Slideshow<A: ApiClient, R> {
@@ -59,6 +77,9 @@ pub struct Slideshow<A: ApiClient, R> {
     format: String,
     /// [None] unless the web app is running, as it is the only thing that changes the album
     refresh: Option<Refresh>,
+    /// Keeps the "album is empty" warning to one line per spell of emptiness rather than one per
+    /// second for as long as it lasts
+    waiting_for_a_photo: bool,
 }
 
 impl<A: ApiClient, R: Random> Slideshow<A, R> {
@@ -73,6 +94,7 @@ impl<A: ApiClient, R: Random> Slideshow<A, R> {
             locale,
             format: format.unwrap_or("%x").to_string(),
             refresh: None,
+            waiting_for_a_photo: false,
         }
     }
 
@@ -109,7 +131,19 @@ impl<A: ApiClient, R: Random> Slideshow<A, R> {
                 self.photo_display_sequence.clear();
             }
             if self.slideshow_ended() {
-                self.initialize()?;
+                match self.initialize() {
+                    Ok(()) => self.waiting_for_a_photo = false,
+                    Err(error) if self.can_wait_for_a_photo(&error) => {
+                        if !self.waiting_for_a_photo {
+                            log::warn!("{error}, waiting for the web app to be used to add one");
+                            self.waiting_for_a_photo = true;
+                        }
+                        /* Whatever was on screen stays there. Save on CPU and request flooding */
+                        thread_sleep(LOOP_SLEEP_DURATION);
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
             }
 
             let photo = self
@@ -138,6 +172,12 @@ impl<A: ApiClient, R: Random> Slideshow<A, R> {
         self.photo_display_sequence.is_empty()
     }
 
+    /// An empty album is only something to sit out while the web app is running: it is the only
+    /// way a photo can arrive, so without it waiting would be waiting forever.
+    fn can_wait_for_a_photo(&self, error: &anyhow::Error) -> bool {
+        self.refresh.is_some() && error.is::<AlbumEmpty>()
+    }
+
     fn initialize(&mut self) -> Result<()> {
         assert!(
             self.photo_display_sequence.is_empty(),
@@ -145,7 +185,7 @@ impl<A: ApiClient, R: Random> Slideshow<A, R> {
         );
         let photos = self.api_client.get_photo_metadata(self.order.into())?;
         if photos.is_empty() {
-            bail!("Album is empty");
+            bail!(AlbumEmpty);
         }
         let item_count = photos.len();
         self.photo_display_sequence.reserve(item_count);
@@ -858,6 +898,52 @@ mod tests {
         refresh.request();
         slideshow.get_next_photo().unwrap();
         slideshow.get_next_photo().unwrap();
+    }
+
+    /// Deleting the last photo through the web app used to take the slideshow thread down with
+    /// it, which is a hard failure reached by an ordinary action
+    #[test]
+    fn get_next_photo_waits_while_the_album_is_empty_and_the_web_app_can_fill_it() {
+        let mut transport = MockFtpTransport::new();
+        transport.expect_is_connected().return_const(true);
+        transport
+            .expect_list_dir()
+            .times(1)
+            .return_once(|_| Ok(vec![]));
+        transport.expect_list_dir().times(1).return_once(|_| {
+            Ok(vec![DirEntry {
+                name: "late.jpg".to_string(),
+                kind: EntryKind::File,
+                modified: None,
+            }])
+        });
+        transport
+            .expect_retrieve()
+            .return_once(|_| Ok(Bytes::from_static(&[42])));
+        let mut slideshow = new_ftp_slideshow(transport, FakeRandom::default())
+            .with_refresh(Some(Refresh::default()));
+
+        let result = slideshow.get_next_photo();
+
+        assert_eq!(
+            result.unwrap().bytes,
+            Bytes::from_static(&[42]),
+            "the slideshow has to sit out the empty album and pick up the photo that arrives"
+        );
+    }
+
+    /// Without the web app nothing can add a photo, so waiting would be waiting forever and an
+    /// empty album stays what it always was: a share link worth complaining about
+    #[test]
+    fn get_next_photo_reports_an_empty_album_when_there_is_no_web_app() {
+        let mut transport = MockFtpTransport::new();
+        transport.expect_is_connected().return_const(true);
+        transport.expect_list_dir().return_once(|_| Ok(vec![]));
+        let mut slideshow = new_ftp_slideshow(transport, FakeRandom::default());
+
+        let result = slideshow.get_next_photo();
+
+        assert!(result.is_err_and(|error| error.is::<AlbumEmpty>()));
     }
 
     /// The mock is owned by the client, so its expectations are verified when the slideshow is
