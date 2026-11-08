@@ -109,6 +109,16 @@ impl Response {
         response
     }
 
+    /// The photo itself, as it is stored. Nothing is re-encoded: the frame is on the same network
+    /// as whatever is asking, and rendering a second size would mean a second cache and a second
+    /// chance to get EXIF orientation wrong.
+    fn photo(body: Vec<u8>, content_type: &'static str) -> Self {
+        let mut response = Self::new(200, content_type, body);
+        /* Same reasoning as a preview: the bytes behind a path do not change */
+        response.headers = vec![("Cache-Control", "private, max-age=86400".to_string())];
+        response
+    }
+
     fn unauthorized() -> Self {
         let mut response = Self::error(401, "Log in to manage the photos on this frame");
         response.headers.push((
@@ -201,6 +211,14 @@ pub fn handle<T: FtpTransport>(
             }
         }
 
+        (Some(Method::Get), "/api/photo") => {
+            let path = raw(&url, "path");
+            match state.files.read(&path) {
+                Ok(bytes) => Response::photo(bytes.to_vec(), content_type_of(&path)),
+                Err(error) => failed(error),
+            }
+        }
+
         (Some(Method::Post), "/api/upload") => guarded(request, || {
             let Some(announced_length) = request.announced_length else {
                 /* Without it a transfer that stops early is indistinguishable from one that
@@ -254,13 +272,25 @@ pub fn handle<T: FtpTransport>(
 
         /* A known route reached with the wrong verb, which for the mutating ones is what an <img>
          * pointed at the delete route would look like */
-        (_, "/" | "/api/list" | "/api/thumbnail") => {
+        (_, "/" | "/api/list" | "/api/thumbnail" | "/api/photo") => {
             Response::error(405, "That address does not accept this kind of request")
         }
         (_, "/api/upload" | "/api/delete" | "/api/mkdir" | "/api/rmdir") => {
             Response::error(405, "That address only accepts POST")
         }
         _ => Response::error(404, "No such address"),
+    }
+}
+
+/// Which of the two formats a photo is in.
+///
+/// `files` has already refused anything that is not one of them, so the choice is only between
+/// these two and the extension is all it takes.
+fn content_type_of(path: &str) -> &'static str {
+    if path.to_ascii_lowercase().ends_with(".png") {
+        "image/png"
+    } else {
+        "image/jpeg"
     }
 }
 
@@ -798,6 +828,47 @@ mod tests {
         );
 
         assert_eq!(response.status, 409);
+    }
+
+    #[test]
+    fn handle_serves_the_photo_itself_untouched() {
+        let mut transport = MockFtpTransport::new();
+        transport.expect_is_connected().return_const(true);
+        transport
+            .expect_retrieve()
+            .return_once(|_| Ok(Bytes::from_static(crate::web::thumbnails::TEST_JPEG)));
+
+        let response = answer(
+            &state(transport),
+            &request(Method::Get, "/api/photo?path=a.jpg"),
+        );
+
+        assert_eq!(response.status, 200);
+        assert_eq!(response.content_type, "image/jpeg");
+        assert_eq!(
+            response.body,
+            crate::web::thumbnails::TEST_JPEG,
+            "the photo has to arrive as it is stored, not re-encoded"
+        );
+    }
+
+    #[test]
+    fn handle_serves_a_png_as_a_png() {
+        let mut transport = MockFtpTransport::new();
+        transport.expect_is_connected().return_const(true);
+        transport
+            .expect_retrieve()
+            .return_once(|_| Ok(Bytes::from_static(b"not really a png")));
+
+        let response = answer(
+            &state(transport),
+            &request(Method::Get, "/api/photo?path=Holiday%2Fa.PNG"),
+        );
+
+        assert_eq!(
+            response.content_type, "image/png",
+            "the extension decides, and it is matched without regard to case"
+        );
     }
 
     #[test]
