@@ -185,6 +185,32 @@
     color: var(--text);
     box-shadow: 0 .5rem 1.5rem rgba(0, 0, 0, .5);
   }
+
+  .tile img { cursor: zoom-in; }
+
+  #viewer {
+    position: fixed;
+    inset: 0;
+    z-index: 5;
+    display: flex;
+    flex-direction: column;
+    background: rgba(0, 0, 0, .92);
+  }
+  /* display: flex above would otherwise win over the hidden attribute */
+  #viewer[hidden] { display: none; }
+  #viewer .bar {
+    display: flex;
+    align-items: center;
+    gap: .75rem;
+    padding: calc(.75rem + env(safe-area-inset-top)) 1rem .75rem;
+  }
+  #viewer .bar .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #viewer img {
+    flex: 1;
+    min-height: 0;
+    object-fit: contain;
+    padding: 0 1rem calc(1rem + env(safe-area-inset-bottom));
+  }
 </style>
 
 <header>
@@ -207,6 +233,15 @@
 <div id="progress" hidden>
   <div class="label"><span class="file"></span><span class="count"></span></div>
   <div class="track"><div class="bar"></div></div>
+</div>
+
+<div id="viewer" hidden>
+  <div class="bar">
+    <span class="name"></span>
+    <a class="button" id="viewer-download" download>Download</a>
+    <button class="button" id="viewer-close">Close</button>
+  </div>
+  <img alt="">
 </div>
 
 <div id="toast" hidden role="alert"></div>
@@ -239,6 +274,11 @@
     progressCount: document.querySelector('#progress .count'),
     progressBar: document.querySelector('#progress .bar'),
     toast: document.getElementById('toast'),
+    viewer: document.getElementById('viewer'),
+    viewerImage: document.querySelector('#viewer img'),
+    viewerName: document.querySelector('#viewer .name'),
+    viewerDownload: document.getElementById('viewer-download'),
+    viewerClose: document.getElementById('viewer-close'),
   };
 
   /* Path of the folder on screen, relative to the shared directory, "" for the shared directory
@@ -247,6 +287,9 @@
   let currentPath = '';
   let shown = 0;
   let photos = [];
+  /* Kept because deleting the last photo of a folder has to decide whether the folder is now
+   * empty, and the listing that said so is long gone by then */
+  let directories = [];
 
   /* Requests */
 
@@ -370,9 +413,20 @@
     for (const photo of page) el.grid.append(tileFor(photo));
     shown += page.length;
 
+    updateFolderControls();
+  }
+
+  /* Everything whose state depends on what the folder holds right now. Deleting a photo changes
+   * all of it, and used to change none of it: the count kept its old number, the folder never
+   * admitted to being empty, and its delete button stayed hidden until you navigated away. */
+  function updateFolderControls() {
     const remaining = photos.length - shown;
     el.loadMore.hidden = remaining <= 0;
     el.loadMore.textContent = `Show ${Math.min(remaining, PAGE_SIZE)} more of ${remaining}`;
+    el.empty.hidden = directories.length > 0 || photos.length > 0;
+    /* Only an empty folder can be removed, and never the shared directory itself */
+    el.removeFolder.hidden =
+      !(currentPath !== '' && directories.length === 0 && photos.length === 0);
   }
 
   function tileFor(photo) {
@@ -398,9 +452,29 @@
 
     const tile = document.createElement('div');
     tile.className = 'tile';
+    image.onclick = () => openViewer(path, photo.name);
     remove.onclick = () => deletePhoto(path, photo.name, tile);
     tile.append(image, caption, remove);
     return tile;
+  }
+
+  /* The grid only ever shows 320px previews, so there has to be a way to actually look at a
+   * photo. The original bytes are served as they are stored: on a home network that is cheaper
+   * than having the frame scale a second size, and it doubles as the download. */
+  function openViewer(path, name) {
+    const source = url('/api/photo', { path });
+    el.viewerImage.src = source;
+    el.viewerImage.alt = name;
+    el.viewerName.textContent = name;
+    el.viewerDownload.href = source;
+    el.viewerDownload.setAttribute('download', name);
+    el.viewer.hidden = false;
+  }
+
+  function closeViewer() {
+    el.viewer.hidden = true;
+    /* Stops a photo nobody is looking at any more from going on downloading */
+    el.viewerImage.removeAttribute('src');
   }
 
   function showError(error) {
@@ -417,14 +491,12 @@
       const listing = await request('GET', '/api/list', { path });
       currentPath = path;
       photos = listing.photos;
+      directories = listing.directories;
       shown = 0;
       el.grid.replaceChildren();
       renderBreadcrumb();
-      renderFolders(listing.directories);
+      renderFolders(directories);
       renderNextPage();
-      el.empty.hidden = listing.directories.length > 0 || photos.length > 0;
-      /* Only an empty folder can be removed, and never the shared directory itself */
-      el.removeFolder.hidden = !(path !== '' && listing.directories.length === 0 && photos.length === 0);
       scrollTo({ top: 0 });
     } catch (error) {
       showError(error);
@@ -435,24 +507,34 @@
     el.fileInput.disabled = true;
     el.progress.hidden = false;
     let uploaded = 0;
+    const rejected = [];
     try {
       /* One at a time. The frame holds a single FTP session, so parallel uploads would queue up
        * inside it anyway, and this way the progress bar means something. */
-      for (const file of files) {
+      for (const [index, file] of files.entries()) {
         el.progressFile.textContent = file.name;
-        el.progressCount.textContent = `${uploaded + 1} of ${files.length}`;
+        el.progressCount.textContent = `${index + 1} of ${files.length}`;
         el.progressBar.style.width = '0';
-        await request('POST', '/api/upload', { path: currentPath, name: file.name }, file,
-          (fraction) => { el.progressBar.style.width = `${Math.round(fraction * 100)}%`; });
-        uploaded += 1;
+        try {
+          await request('POST', '/api/upload', { path: currentPath, name: file.name }, file,
+            (fraction) => { el.progressBar.style.width = `${Math.round(fraction * 100)}%`; });
+          uploaded += 1;
+        } catch (error) {
+          /* One file the server will not take -- a HEIC the phone did not convert, most often --
+           * used to abandon every file queued behind it. They are independent uploads; the rest
+           * go, and what did not is reported once at the end. */
+          rejected.push(`${file.name}: ${error.message}`);
+        }
       }
-    } catch (error) {
-      showError(error);
     } finally {
       el.progress.hidden = true;
       el.fileInput.disabled = false;
       el.fileInput.value = '';
       if (uploaded > 0) await openFolder(currentPath);
+      if (rejected.length === 1) showError(new Error(rejected[0]));
+      else if (rejected.length > 1) {
+        showError(new Error(`${rejected.length} of ${files.length} were not uploaded. ${rejected.join(' ')}`));
+      }
     }
   }
 
@@ -463,6 +545,7 @@
       tile.remove();
       photos = photos.filter((photo) => photo.name !== name);
       shown -= 1;
+      updateFolderControls();
     } catch (error) {
       showError(error);
     }
@@ -493,6 +576,14 @@
   el.fileInput.onchange = () => {
     if (el.fileInput.files.length > 0) uploadAll([...el.fileInput.files]);
   };
+  el.viewerClose.onclick = closeViewer;
+  /* The bar is excluded so that reaching for Download does not dismiss the thing being downloaded */
+  el.viewer.onclick = (event) => {
+    if (event.target === el.viewer || event.target === el.viewerImage) closeViewer();
+  };
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && !el.viewer.hidden) closeViewer();
+  });
   el.newFolder.onclick = createFolder;
   el.removeFolder.onclick = removeFolder;
   el.loadMore.onclick = renderNextPage;
