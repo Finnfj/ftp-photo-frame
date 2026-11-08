@@ -1,6 +1,6 @@
 [package]
 name = "syno-photo-frame"
-version = "0.18.2"
+version = "0.18.3"
 edition = "2024"
 description = "Full-screen slideshow for Synology Photos and Immich albums, and for FTP servers"
 license = "GPL-3.0-or-later"

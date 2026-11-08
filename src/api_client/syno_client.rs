@@ -123,11 +123,7 @@ impl<H: HttpClient, C: CookieStore> ApiClient for SynoApiClient<'_, H, C> {
         let response = self
             .http_client
             .get(self.api_thumbnail_get_url.as_str(), &params)?;
-        read_response(response, |response| {
-            let bytes = response.bytes()?;
-            Ok(bytes)
-        })
-        .map_photo_not_found()
+        read_response(response, HttpResponse::bytes).map_photo_not_found()
     }
 }
 
