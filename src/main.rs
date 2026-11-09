@@ -24,14 +24,9 @@ fn main() -> Result<()> {
         if error.is::<QuitEvent>() {
             return Ok(());
         }
-        log::error!("{error}");
-        if let Some(LoginError(_)) = error.downcast_ref::<LoginError>() {
-            bail!(
-                "Login failed. Make sure the share link is pointing to a *publicly shared album*. \
-                If the album's password link protection is enabled, use the --password option with \
-                a valid password.",
-            )
-        }
+        /* Alternate form, so the advice added further in and the failure it explains are both
+         * logged rather than only the outermost one */
+        log::error!("{error:#}");
         bail!(error)
     }
     Ok(())
@@ -72,4 +67,28 @@ fn init_and_run() -> Result<()> {
         env!("CARGO_PKG_VERSION"),
         &EnvImpl,
     )
+    .map_err(|error| explain_login_failure(&cli, error))
+}
+
+/// Turns a failed login into advice that fits the backend in use.
+///
+/// A rejected FTP login has nothing to do with shared albums or link protection, and telling
+/// somebody staring at "530 Login incorrect" to check their album's sharing settings sends them
+/// looking in the wrong place entirely.
+fn explain_login_failure(cli: &Cli, error: anyhow::Error) -> anyhow::Error {
+    if !error.is::<LoginError>() {
+        return error;
+    }
+    match cli.share_link.scheme() {
+        "ftp" | "ftps" => error.context(
+            "Login failed. Check the user name in the share link and the password given with \
+             --password; see --help for the ways it can be passed. Leaving the user out of the \
+             link logs in anonymously.",
+        ),
+        _ => error.context(
+            "Login failed. Make sure the share link is pointing to a *publicly shared album*. If \
+             the album's password link protection is enabled, use the --password option with a \
+             valid password.",
+        ),
+    }
 }
