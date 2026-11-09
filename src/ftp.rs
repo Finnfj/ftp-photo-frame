@@ -362,9 +362,15 @@ impl FtpTransport for SuppaFtpTransport {
 
     #[cfg(feature = "web")]
     fn store(&mut self, path: &str, mut source: &mut dyn std::io::Read) -> Result<u64> {
-        self.stream_mut()?
+        /* An upload travels over a data connection like a download, so it stalls the same way and
+         * wants the same pair of lines around it */
+        log::debug!("Uploading {path}");
+        let stored = self
+            .stream_mut()?
             .put_file(path, &mut source)
-            .map_err(map_error)
+            .map_err(map_error)?;
+        log::debug!("Uploaded {stored} bytes to {path}");
+        Ok(stored)
     }
 
     #[cfg(feature = "web")]
