@@ -320,6 +320,10 @@ where
 
             let elapsed_display_duration = Instant::now() - last_change;
             if elapsed_display_duration < cli.photo_change_interval {
+                /* Reported so that the activity changes between photos. Without it the thread
+                 * stays on "showing a photo" from the first one onwards, and its age -- the whole
+                 * point of reporting it -- grows for ever on a perfectly healthy frame. */
+                diagnostics.doing(DISPLAY, "waiting for the interval to pass");
                 thread_sleep(LOOP_SLEEP_DURATION);
                 continue;
             }

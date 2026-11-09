@@ -3,6 +3,39 @@
 This describes building and testing this fork. For installing the app on a
 Raspberry Pi, see [README.md](README.md).
 
+## Testing on the device
+
+Unit tests say the code is right; they cannot say the thing runs on a
+Raspberry Pi. `make deploy-and-test` cross-builds the frame, copies it
+and a small harness to the device, and runs the web app checks there
+against a throwaway album:
+
+```bash
+PI_HOST=raspberrypi.local PI_USER=pi make deploy-and-test
+```
+
+It needs key-based ssh to the device and `cross` for the build; pass
+`BINARY=path/to/binary` to skip the build and use one you already have.
+
+Nothing is installed on the device and a frame already running on it is
+left alone: the harness uses its own album under `~/.cache`, its own FTP
+port and its own web port, and never touches the service. The only thing
+it leaves behind is a virtualenv holding `pyftpdlib`, kept so the next
+run is quick.
+
+The last check is the one worth having. After the request-based checks
+it waits and reads `last_photo_shown_seconds_ago` from `/api/status`: a
+frame that has wedged fails there even though every route still answers,
+which is exactly the shape a hang takes.
+
+The same checks run against any instance, including one on this machine:
+
+```bash
+BASE=http://127.0.0.1:8080 AUTH=frame:yourpassword bash scripts/web-app-checks.sh
+```
+
+Point them only at a test album. They create and delete things.
+
 ## Host build and tests
 
 The tests link against SDL2, so its development packages have to be installed
