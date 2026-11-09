@@ -120,6 +120,11 @@ impl<A: ApiClient, R: Random> Slideshow<A, R> {
 
     pub fn get_next_photo(&mut self) -> Result<BytesPhoto> {
         const LOOP_SLEEP_DURATION: Duration = Duration::from_secs(1);
+        /* One second is right for a photo that vanished mid-round, where the next entry of the
+         * sequence is very likely still there. It is far too eager for an empty album, which can
+         * last all night and costs a full recursive listing over FTP on every attempt. Ten
+         * seconds is still faster than anyone gets from uploading a photo to looking at a frame. */
+        const EMPTY_ALBUM_POLL: Duration = Duration::from_secs(10);
         /* Loop here prevents display of error screen when the photo has simply been removed from
          * the album since we fetched its metadata. */
         loop {
@@ -138,8 +143,8 @@ impl<A: ApiClient, R: Random> Slideshow<A, R> {
                             log::warn!("{error}, waiting for the web app to be used to add one");
                             self.waiting_for_a_photo = true;
                         }
-                        /* Whatever was on screen stays there. Save on CPU and request flooding */
-                        thread_sleep(LOOP_SLEEP_DURATION);
+                        /* Whatever was on screen stays there */
+                        thread_sleep(EMPTY_ALBUM_POLL);
                         continue;
                     }
                     Err(error) => return Err(error),

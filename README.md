@@ -204,8 +204,9 @@ and with `--order random` the photos are shuffled again.
   come round again
 * A single upload is limited to 64 MB
 * Deleting the last photo leaves the frame showing whatever was on
-  screen until a photo is uploaded again. Without the web app running
-  an empty album is still a fatal error, as nothing could fill it
+  screen until a photo is uploaded again, which it checks for every ten
+  seconds. Without the web app running an empty album is still a fatal
+  error, as nothing could fill it
 * The page is only reachable by IP address, by `localhost`, or by a
   `.local` name, and only on the port the frame listens on. Reaching it
   under any other name -- a DNS name you registered for it, or a
