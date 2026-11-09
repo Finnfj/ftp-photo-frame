@@ -28,6 +28,29 @@ it waits and reads `last_photo_shown_seconds_ago` from `/api/status`: a
 frame that has wedged fails there even though every route still answers,
 which is exactly the shape a hang takes.
 
+## Watching for the hang
+
+The checks above say the frame works now. They cannot catch something
+that happens once a week. `scripts/soak.sh` watches a running frame and
+says when it stops:
+
+```bash
+BASE=http://raspberrypi.local:8080 AUTH=frame:yourpassword HOURS=12 bash scripts/soak.sh
+```
+
+Unlike the checks, this one is **read-only**: it asks for `/api/status`
+and nothing else, so it is meant to be pointed at the frame you actually
+use, with the album you actually care about.
+
+It reports a stall when no photo has appeared for `MAX_STALE` seconds
+(default 600, so raise it if your `--interval` is long) or when a thread
+has sat on one activity for `MAX_BUSY` seconds. A display in standby and
+an album waiting for its first upload are not stalls, and are not
+reported as such.
+
+Every reading is kept as JSON, so when it does trip you have the history
+leading up to it rather than just the moment.
+
 The same checks run against any instance, including one on this machine:
 
 ```bash
