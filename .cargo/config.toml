@@ -1,6 +1,10 @@
 # The target is deliberately not set here: cargo test, cargo clippy and rust-analyzer have to build
-# for the host. Cross-compiling for the Raspberry Pi is done explicitly with `cross build --target
-# aarch64-unknown-linux-gnu`, see BUILD.md.
+# for the host. Cross-compiling for the Raspberry Pi is done explicitly with
+# `scripts/build-aarch64.sh`, see BUILD.md.
+#
+# The linker below is for a cross build run directly on a machine that has the toolchain and the
+# target's SDL2 libraries installed. The script does not rely on it: its image sets the same thing
+# in the environment.
 
 [target.aarch64-unknown-linux-gnu]
 linker = "aarch64-linux-gnu-gcc"
