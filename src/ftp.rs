@@ -2,14 +2,16 @@
 
 use std::{
     fmt::{self, Formatter},
-    net::ToSocketAddrs,
+    net::{SocketAddr, TcpStream, ToSocketAddrs},
     time::{Duration, SystemTime},
 };
 
 use anyhow::{Result, anyhow, bail};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use suppaftp::{FtpError, Mode, Status, list::ListParser, types::FileType as TransferType};
+use suppaftp::{
+    FtpError, FtpResult, Mode, Status, list::ListParser, types::FileType as TransferType,
+};
 
 /// FTPS is optional, and [suppaftp::RustlsFtpStream] communicates in plain text until it is told to
 /// negotiate TLS, so one stream type covers both cases
@@ -131,6 +133,29 @@ enum Listing {
     List,
 }
 
+/// Opens a data connection that gives up rather than waiting forever.
+///
+/// suppaftp's own builder is a bare [TcpStream::connect], so a transfer that stalls part way
+/// through never ends and never errors. Using the same timeout as the control connection keeps
+/// `--timeout` meaning one thing: how long the frame waits on this server, whatever it is
+/// waiting for. With FTPS the TLS layer is wrapped around this socket afterwards, so the
+/// timeouts still apply underneath it.
+fn data_connection_builder(
+    timeout: Duration,
+) -> impl Fn(SocketAddr) -> FtpResult<TcpStream> + Send + Sync + 'static {
+    move |address| {
+        let socket =
+            TcpStream::connect_timeout(&address, timeout).map_err(FtpError::ConnectionError)?;
+        socket
+            .set_read_timeout(Some(timeout))
+            .map_err(FtpError::ConnectionError)?;
+        socket
+            .set_write_timeout(Some(timeout))
+            .map_err(FtpError::ConnectionError)?;
+        Ok(socket)
+    }
+}
+
 /// Isolates [suppaftp]
 pub struct SuppaFtpTransport {
     timeout: Duration,
@@ -175,6 +200,12 @@ impl FtpTransport for SuppaFtpTransport {
         let socket = stream.get_ref();
         socket.set_read_timeout(Some(self.timeout))?;
         socket.set_write_timeout(Some(self.timeout))?;
+        /* The control connection is only half of it. Every byte of a photo, and every directory
+         * listing, travels over a separate data connection that suppaftp opens per transfer, and
+         * its default builder sets no timeout at all. A server that accepts the connection and
+         * then goes quiet parks the photo fetching thread for good, with nothing to reconnect
+         * from because no error is ever reported. */
+        stream = stream.passive_stream_builder(data_connection_builder(self.timeout));
         /* Stated explicitly although it is the default: a photo frame is behind NAT, and active
          * mode would require the server to connect back to it */
         stream.set_mode(Mode::Passive);
@@ -206,6 +237,10 @@ impl FtpTransport for SuppaFtpTransport {
     fn list_dir(&mut self, path: &str) -> Result<Vec<DirEntry>> {
         let remembered_listing = self.listing;
         let stream = self.stream_mut()?;
+        /* Both this and the download below open a data connection, which is where a stalling
+         * server leaves the frame waiting. Logging before the attempt is what makes the last
+         * line of a log say what the frame was doing when it stopped. */
+        log::debug!("Listing {path}");
         /* Changing directory and then listing without an argument avoids two problems with passing
          * the path to the listing command: servers that interpret it as a glob pattern, and servers
          * that split it on spaces. */
@@ -234,10 +269,15 @@ impl FtpTransport for SuppaFtpTransport {
     }
 
     fn retrieve(&mut self, path: &str) -> Result<Bytes> {
+        log::debug!("Downloading {path}");
         /* Unlike the listing commands, RETR takes the remainder of the command line as the file
          * name, so an absolute path can be passed directly. */
         let file = self.stream_mut()?.retr_as_buffer(path).map_err(map_error)?;
-        Ok(Bytes::from(file.into_inner()))
+        let bytes = Bytes::from(file.into_inner());
+        /* Paired with the line above on purpose: a download that started and never finished is
+         * the signature of the stall this timeout exists for, and only the pair shows it */
+        log::debug!("Downloaded {} bytes from {path}", bytes.len());
+        Ok(bytes)
     }
 
     fn disconnect(&mut self) {
@@ -384,7 +424,51 @@ pub fn validate_path(path: &str) -> Result<()> {
 mod tests {
     use super::*;
 
+    use std::{io::Read, net::TcpListener, time::Instant};
+
     use chrono::TimeZone;
+
+    /// The bug this guards against is not a wrong value but an unbounded wait: suppaftp's own
+    /// builder sets no timeout, so a server that accepts the data connection and then says
+    /// nothing used to park the photo fetching thread until the frame was restarted.
+    #[test]
+    fn a_data_connection_that_goes_quiet_gives_up() {
+        const TIMEOUT: Duration = Duration::from_millis(250);
+        /* Never accepted, so the connection completes through the backlog and no byte ever
+         * arrives -- a server that has stopped talking, without needing one to be written */
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port has to be free");
+        let address = listener.local_addr().unwrap();
+
+        let mut socket = data_connection_builder(TIMEOUT)(address).unwrap();
+        let started = Instant::now();
+        let result = socket.read(&mut [0u8; 1]);
+
+        assert!(result.is_err(), "the read has to end in an error, not data");
+        assert!(
+            started.elapsed() >= TIMEOUT,
+            "it gave up before the timeout was up"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "it waited far past the timeout, which is the hang this test exists for"
+        );
+    }
+
+    #[test]
+    fn a_data_connection_carries_the_timeout_in_both_directions() {
+        const TIMEOUT: Duration = Duration::from_millis(250);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port has to be free");
+        let address = listener.local_addr().unwrap();
+
+        let socket = data_connection_builder(TIMEOUT)(address).unwrap();
+
+        assert_eq!(socket.read_timeout().unwrap(), Some(TIMEOUT));
+        assert_eq!(
+            socket.write_timeout().unwrap(),
+            Some(TIMEOUT),
+            "an upload to a server that stops reading hangs just as badly as a download"
+        );
+    }
 
     #[test]
     fn parse_entry_reads_mlsd_file_with_modification_time() {
