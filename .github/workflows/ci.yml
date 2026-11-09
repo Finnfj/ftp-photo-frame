@@ -42,25 +42,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: aarch64
-
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cross
-
-      # Installing the SDL2 packages for the target architecture (see docker/Dockerfile) runs their
-      # maintainer scripts, which are aarch64 executables, so the kernel has to know how to run
-      # those. Nothing else about the build is emulated.
-      - uses: docker/setup-qemu-action@v3
-        with:
-          platforms: arm64
-
-      # The SDL2 libraries for the target architecture come from docker/Dockerfile, see Cross.toml
-      - run: cross build --locked --release --all-features --target aarch64-unknown-linux-gnu
+      # Built inside docker/Dockerfile's image, which is based on the same Debian release as
+      # Raspberry Pi OS. The script fails the build if the result needs a newer glibc than the
+      # device has -- the one thing this job could not previously notice, because it builds the
+      # binary and never runs it.
+      #
+      # No QEMU and no cross: the image installs plain arm64 library packages, whose maintainer
+      # scripts do not execute target binaries.
+      - run: bash scripts/build-aarch64.sh
 
       - uses: actions/upload-artifact@v4
         with:

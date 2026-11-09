@@ -37,32 +37,33 @@ that `.cargo/config.toml` deliberately does *not* set a default target, so plain
 Podman) are needed:
 
 ```bash
-cargo install cross --git https://github.com/cross-rs/cross
-cross build --release --all-features --target aarch64-unknown-linux-gnu
+bash scripts/build-aarch64.sh
 ```
-
-The first build extends the stock cross image with the SDL2 packages for the target architecture,
-which runs their aarch64 maintainer scripts. The host therefore has to know how to execute aarch64
-binaries, which is a one-time registration:
-
-```bash
-docker run --privileged --rm multiarch/qemu-user-static --reset -p yes
-```
-
-Without it, the image build fails with `/usr/bin/python3.12: Exec format error`. Only those install
-scripts are emulated; compiling is a genuine cross-compile.
 
 The binary ends up in `target/aarch64-unknown-linux-gnu/release/syno-photo-frame`.
+It needs Docker or Podman; the script uses whichever is installed and takes
+`ENGINE=podman` to be told explicitly.
 
-`Cross.toml` points cross at `docker/Dockerfile`, which adds the SDL2 libraries
-for the target architecture to the stock cross image. The first build therefore
-takes a while, as that image has to be built once.
+`docker/Dockerfile` describes the image: Debian bookworm, the aarch64 toolchain,
+and the SDL2 libraries for the target architecture. Bookworm specifically,
+because that is what Raspberry Pi OS is. A binary cannot start on a system whose
+glibc is older than the one it was linked against, so the base image sets the
+floor, and the script refuses to finish if the result needs anything newer than
+glibc 2.36:
 
-With Podman instead of Docker:
-
-```bash
-CROSS_CONTAINER_ENGINE=podman cross build --release --all-features --target aarch64-unknown-linux-gnu
 ```
+ERROR: this binary needs glibc 2.39 and will not start on Raspberry Pi OS.
+```
+
+That check exists because the opposite happened. The image used to be based on
+the stock cross-rs one, tracked by a floating `main` tag; when that moved to
+Ubuntu 24.04 the artifact kept building and uploading and silently stopped being
+able to run on the device. CI could not catch it, because building a binary says
+nothing about whether it starts.
+
+The first build is slow, as the image has to be made once. No QEMU registration
+is needed: the arm64 packages are libraries whose maintainer scripts do not run
+target binaries.
 
 Copy the binary to the Pi, for example:
 

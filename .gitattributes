@@ -1,0 +1,15 @@
+# Scripts must keep LF endings whatever platform they are checked out on. A shell script checked
+# out with CRLF does not run: bash reads the carriage return as part of the command and reports
+# "$'\r': command not found". These are copied to a Raspberry Pi and run there, so a Windows
+# checkout producing CRLF breaks the device test before it starts.
+*.sh text eol=lf
+*.py text eol=lf
+Makefile text eol=lf
+
+# The Debian maintainer scripts and the systemd unit are read by the device too
+dpkg/postinst text eol=lf
+dpkg/prerm text eol=lf
+dpkg/postrm text eol=lf
+dpkg/conffiles text eol=lf
+dpkg/*.service text eol=lf
+dpkg/*.default text eol=lf
