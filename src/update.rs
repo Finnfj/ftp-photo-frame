@@ -1,6 +1,6 @@
 use std::{
     sync::mpsc::SyncSender,
-    thread::{Scope, ScopedJoinHandle},
+    thread::{self, Scope, ScopedJoinHandle},
 };
 
 use anyhow::Result;
@@ -52,20 +52,23 @@ pub fn check_for_updates_thread<'a, C: HttpClient + Sync>(
     thread_scope: &'a Scope<'a, '_>,
     update_check_sender: SyncSender<bool>,
 ) -> ScopedJoinHandle<'a, ()> {
-    thread_scope.spawn(move || {
-        match api_crates::get_latest_version(client) {
-            Ok(remote_crate) => {
-                if remote_crate.vers != this_crate_version {
-                    log::info!(
-                        "New version is available ({this_crate_version} -> {})",
-                        remote_crate.vers
-                    );
-                    update_check_sender.try_send(true).unwrap_or_default();
+    thread::Builder::new()
+        .name("update-check".to_string())
+        .spawn_scoped(thread_scope, move || {
+            match api_crates::get_latest_version(client) {
+                Ok(remote_crate) => {
+                    if remote_crate.vers != this_crate_version {
+                        log::info!(
+                            "New version is available ({this_crate_version} -> {})",
+                            remote_crate.vers
+                        );
+                        update_check_sender.try_send(true).unwrap_or_default();
+                    }
                 }
-            }
-            Err(error) => {
-                log::error!("Check for updates: {error}");
-            }
-        };
-    })
+                Err(error) => {
+                    log::error!("Check for updates: {error}");
+                }
+            };
+        })
+        .expect("the operating system has to be able to start a thread")
 }

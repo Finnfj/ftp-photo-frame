@@ -15,11 +15,34 @@ use syno_photo_frame::{
     standby::{self, CommandDisplayPower, Standby},
 };
 
+/// Sends panics through the logger as well as to stderr.
+///
+/// A panic in a worker thread does not stop the frame, it quietly removes a piece of it, so the
+/// evidence has to survive in the same place as every other line the frame writes. The default
+/// hook only reaches stderr, which under the documented crontab autostart ends up somewhere
+/// different from the log and under systemd carries none of the logger's formatting.
+///
+/// The default hook is kept and called afterwards, so `RUST_BACKTRACE=1` still prints a
+/// backtrace. The cost is that the message itself appears twice, which is a fair trade for a
+/// line that only appears when something has already gone wrong.
+fn log_panics() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let thread = std::thread::current();
+        log::error!(
+            "Thread '{}' panicked: {info}",
+            thread.name().unwrap_or("unnamed")
+        );
+        default_hook(info);
+    }));
+}
+
 fn main() -> Result<()> {
     SimpleLogger::new()
         .with_level(LevelFilter::Info) /* Default */
         .env() /* Allow overwriting default level with RUST_LOG env var */
         .init()?;
+    log_panics();
 
     if let Err(error) = init_and_run() {
         if error.is::<QuitEvent>() {

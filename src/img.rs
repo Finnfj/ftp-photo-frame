@@ -212,24 +212,33 @@ fn background_fill_threads(
             h2.ceil() as u32,
         ),
     );
-    let bg_thread1 = thread::spawn(move || {
-        let bg = resize_preserving_aspect(
-            &bg_crop1,
-            (x_res, y_res),
-            ResizeAlg::Nearest,
-            FilterType::Nearest,
-        );
-        brighten_and_blur(&bg)
-    });
-    let bg_thread2 = thread::spawn(move || {
-        let bg = resize_preserving_aspect(
-            &bg_crop2,
-            (x_res, y_res),
-            ResizeAlg::Nearest,
-            FilterType::Nearest,
-        );
-        brighten_and_blur(&bg)
-    });
+    /* Named so that a panic in here says which thread it was. These are joined with unwrap
+     * below, which makes the panic the photo fetching thread's; what stops that from being a
+     * silent freeze is the disconnect check in the main loop, not anything here. */
+    let bg_thread1 = thread::Builder::new()
+        .name("blur-upper".to_string())
+        .spawn(move || {
+            let bg = resize_preserving_aspect(
+                &bg_crop1,
+                (x_res, y_res),
+                ResizeAlg::Nearest,
+                FilterType::Nearest,
+            );
+            brighten_and_blur(&bg)
+        })
+        .expect("the operating system has to be able to start a thread");
+    let bg_thread2 = thread::Builder::new()
+        .name("blur-lower".to_string())
+        .spawn(move || {
+            let bg = resize_preserving_aspect(
+                &bg_crop2,
+                (x_res, y_res),
+                ResizeAlg::Nearest,
+                FilterType::Nearest,
+            );
+            brighten_and_blur(&bg)
+        })
+        .expect("the operating system has to be able to start a thread");
     (bg_thread1, bg_thread2)
 }
 

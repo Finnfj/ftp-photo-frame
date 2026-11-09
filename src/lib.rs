@@ -8,7 +8,7 @@ pub use {api_client::LoginError, rand::RandomImpl};
 use std::{
     error::Error,
     fmt::{Display, Formatter},
-    sync::mpsc::{self, Receiver, SyncSender},
+    sync::mpsc::{self, Receiver, SyncSender, TryRecvError},
     thread::{self, Scope, ScopedJoinHandle},
     time::Duration,
 };
@@ -18,7 +18,7 @@ use std::{thread::sleep as thread_sleep, time::Instant};
 #[cfg(test)]
 use {mock_instant::thread_local::Instant, test_helpers::fake_sleep as thread_sleep};
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use chrono::Locale;
 
 use crate::{
@@ -228,7 +228,9 @@ fn start_web_app<T: crate::ftp::FtpTransport>(
         Duration::from_secs(cli.timeout_seconds.into()),
         refresh.clone(),
     );
-    thread::spawn(move || web::serve(server, state));
+    thread::Builder::new()
+        .name("web".to_string())
+        .spawn(move || web::serve(server, state))?;
     Ok(Some(refresh))
 }
 
@@ -302,8 +304,35 @@ where
                 continue;
             }
 
-            if let Ok(next_photo_result) = photo_receiver.try_recv() {
-                let mut next_photo = match next_photo_result {
+            let received = match photo_receiver.try_recv() {
+                Ok(next_photo_result) => next_photo_result,
+                Err(TryRecvError::Empty) => {
+                    /* next photo is still being fetched and processed, we have to wait for it */
+                    thread_sleep(LOOP_SLEEP_DURATION);
+                    continue;
+                }
+                Err(TryRecvError::Disconnected) => {
+                    /* The photo fetching thread is gone, which at this point can only mean it
+                     * panicked: it loops until its send fails, and the only way the send fails is
+                     * the receiver being dropped, which happens on the way out of this loop.
+                     *
+                     * This used to be indistinguishable from "no photo ready yet", so the frame
+                     * waited for a photo that could never arrive and kept the last one on screen
+                     * for good, which is the failure mode this arm exists to end.
+                     *
+                     * In practice the error below is rarely what the caller sees: leaving the loop
+                     * ends the surrounding thread::scope, which joins the panicked thread and
+                     * resumes its panic, and that panic wins. Both outcomes end the process, which
+                     * is the point; the arm stays because it is what makes the loop stop, and
+                     * because a fetching thread that ever ends without panicking would otherwise
+                     * freeze the frame again. The panic itself is logged by the hook in main. */
+                    break Err(anyhow!(
+                        "The photo fetching thread has died, so no further photo can be shown"
+                    ));
+                }
+            };
+            {
+                let mut next_photo = match received {
                     Ok(photo) => photo,
                     Err(error) if error.is::<LoginError>() => {
                         /* Login error terminates the main thread loop */
@@ -326,9 +355,6 @@ where
 
                 sdl.swap_textures();
                 current_image = next_photo.image;
-            } else {
-                /* next photo is still being fetched and processed, we have to wait for it */
-                thread_sleep(LOOP_SLEEP_DURATION);
             }
         };
         if loop_result.is_err() {
@@ -367,27 +393,29 @@ where
     .with_random_start(cli.random_start)
     .with_source_size(cli.source_size)
     .with_refresh(refresh);
-    Ok(thread_scope.spawn(move || {
-        loop {
-            let photo_result = slideshow.get_next_photo().and_then(|photo| {
-                load_image_from_memory(&photo.bytes).map(|image| {
-                    DynamicImagePhoto::new(
-                        image.fit_to_screen_and_add_background(
-                            screen_size,
-                            cli.rotation,
-                            cli.background,
-                        ),
-                        photo.info,
-                    )
-                })
-            });
-            /* Blocks until photo is received by the main thread */
-            let send_result = photo_sender.send(photo_result);
-            if send_result.is_err() {
-                break;
+    Ok(thread::Builder::new()
+        .name("photo-fetcher".to_string())
+        .spawn_scoped(thread_scope, move || {
+            loop {
+                let photo_result = slideshow.get_next_photo().and_then(|photo| {
+                    load_image_from_memory(&photo.bytes).map(|image| {
+                        DynamicImagePhoto::new(
+                            image.fit_to_screen_and_add_background(
+                                screen_size,
+                                cli.rotation,
+                                cli.background,
+                            ),
+                            photo.info,
+                        )
+                    })
+                });
+                /* Blocks until photo is received by the main thread */
+                let send_result = photo_sender.send(photo_result);
+                if send_result.is_err() {
+                    break;
+                }
             }
-        }
-    }))
+        })?)
 }
 
 fn load_image_from_memory(bytes: &[u8]) -> Result<DynamicImage> {
@@ -908,6 +936,61 @@ mod tests {
 
     /// Runs the slideshow against a Synology backend that always has photos to offer, so that the
     /// test only observes what standby does to the pacing
+    /// A panic in the fetching thread used to leave the main loop waiting for a photo that could
+    /// never arrive, with the last one on screen and nothing logged to say why.
+    #[test]
+    fn a_dead_photo_fetcher_ends_the_slideshow_instead_of_freezing_it() {
+        const SHARE_LINK: &str = "http://fake.dsm.addr/aa/sharing/FakeSharingId";
+        let mut client_stub = MockHttpClient::new();
+        client_stub
+            .expect_post()
+            .withf(|_, form, _, _| test_helpers::is_login_form(form, "FakeSharingId"))
+            .return_once(|_, _, _, _| Ok(test_helpers::new_success_response_with_json(Login {})));
+        client_stub
+            .expect_post()
+            .withf(|_, form, _, _| test_helpers::is_list_form(form))
+            .returning(|_, _, _, _| {
+                Ok(test_helpers::new_success_response_with_json(List {
+                    list: vec![test_helpers::new_photo_dto(1, "photo1")],
+                }))
+            });
+        /* Stands in for any panic on the fetching thread, the blur workers being the real one */
+        client_stub
+            .expect_get()
+            .returning(|_, _| panic!("pretending the fetching thread fell over"));
+
+        let mut sdl_stub = MockSdl::new().with_default_expectations();
+        sdl_stub.expect_handle_quit_event().returning(|| {
+            MockClock::advance(LOOP_SLEEP_DURATION);
+            std::thread::yield_now();
+            Ok(())
+        });
+        MockClock::set_time(START_TIME);
+        let cli_command = format!(
+            "syno-photo-frame {SHARE_LINK} --interval 30 --disable-update-check --transition none --splash assets/test_loading.jpeg"
+        );
+
+        /* thread::scope resumes a scoped thread's panic when it joins, so the loop's own error is
+         * overridden by that panic. Catching it here keeps the test about the thing that matters:
+         * run returns instead of spinning for ever. */
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run(
+                &Cli::parse_from(cli_command.split_whitespace()),
+                (&client_stub, &Jar::default()),
+                &mut sdl_stub,
+                FakeRandom::default(),
+                "1.2.3",
+                &MockEnv::default().with_default_expectations(),
+                Standby::disabled(),
+            )
+        }));
+
+        assert!(
+            result.is_err(),
+            "the frame has to end rather than wait for a photo that can never arrive"
+        );
+    }
+
     fn run_with_standby(sdl: &mut MockSdl, standby: impl FnOnce() -> Standby) -> Result<()> {
         const SHARE_LINK: &str = "http://fake.dsm.addr/aa/sharing/FakeSharingId";
         const DISPLAY_INTERVAL: u64 = 30;
