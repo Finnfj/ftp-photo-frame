@@ -182,6 +182,21 @@ fetched ahead of the one on screen, so the new photo appears within two
 so with `--order by-date` the slideshow returns to the oldest photo,
 and with `--order random` the photos are shuffled again.
 
+##### Diagnosing a frame that has stopped
+
+The **Status** button on the page shows what each of the frame's threads
+is doing and, more usefully, for how long. A frame that has stopped
+changing photos says so plainly: the photo fetcher sits on one activity
+and its age keeps climbing. The same reading is available as JSON at
+`/api/status` for scripting.
+
+It deliberately reads nothing but values already in memory, so it still
+answers while the connection to the photo server is stuck, which is the
+only time anyone asks it. For the file names behind an activity, run the
+frame with `RUST_LOG=debug`: every download, listing and upload is
+logged before it starts and after it finishes, so a transfer that began
+and never ended is visible as an unpaired line.
+
 ##### Limitations
 
 * The connection is **not encrypted**. The password is sent, readable

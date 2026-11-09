@@ -19,6 +19,7 @@ use chrono::Locale;
 use crate::{
     api_client::{ApiClient, PhotoNotFound},
     cli::{Order, SourceSize},
+    diagnostics::Diagnostics,
     metadata::Metadata,
     rand::Random,
 };
@@ -80,6 +81,8 @@ pub struct Slideshow<A: ApiClient, R> {
     /// Keeps the "album is empty" warning to one line per spell of emptiness rather than one per
     /// second for as long as it lasts
     waiting_for_a_photo: bool,
+    /// [None] when nothing is collecting diagnostics, which is every build without the web app
+    diagnostics: Option<Arc<Diagnostics>>,
 }
 
 impl<A: ApiClient, R: Random> Slideshow<A, R> {
@@ -95,6 +98,7 @@ impl<A: ApiClient, R: Random> Slideshow<A, R> {
             format: format.unwrap_or("%x").to_string(),
             refresh: None,
             waiting_for_a_photo: false,
+            diagnostics: None,
         }
     }
 
@@ -118,6 +122,11 @@ impl<A: ApiClient, R: Random> Slideshow<A, R> {
         self
     }
 
+    pub fn with_diagnostics(mut self, diagnostics: Option<Arc<Diagnostics>>) -> Self {
+        self.diagnostics = diagnostics;
+        self
+    }
+
     pub fn get_next_photo(&mut self) -> Result<BytesPhoto> {
         const LOOP_SLEEP_DURATION: Duration = Duration::from_secs(1);
         /* One second is right for a photo that vanished mid-round, where the next entry of the
@@ -137,11 +146,15 @@ impl<A: ApiClient, R: Random> Slideshow<A, R> {
             }
             if self.slideshow_ended() {
                 match self.initialize() {
-                    Ok(()) => self.waiting_for_a_photo = false,
+                    Ok(()) => {
+                        self.waiting_for_a_photo = false;
+                        self.report_album();
+                    }
                     Err(error) if self.can_wait_for_a_photo(&error) => {
                         if !self.waiting_for_a_photo {
                             log::warn!("{error}, waiting for the web app to be used to add one");
                             self.waiting_for_a_photo = true;
+                            self.report_album();
                         }
                         /* Whatever was on screen stays there */
                         thread_sleep(EMPTY_ALBUM_POLL);
@@ -175,6 +188,12 @@ impl<A: ApiClient, R: Random> Slideshow<A, R> {
 
     const fn slideshow_ended(&self) -> bool {
         self.photo_display_sequence.is_empty()
+    }
+
+    fn report_album(&self) {
+        if let Some(diagnostics) = &self.diagnostics {
+            diagnostics.album(self.photo_display_sequence.len(), self.waiting_for_a_photo);
+        }
     }
 
     /// An empty album is only something to sit out while the web app is running: it is the only

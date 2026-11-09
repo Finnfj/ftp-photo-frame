@@ -3,13 +3,14 @@
 //! Everything here works on plain values rather than on [tiny_http] types, so that the whole route
 //! table can be exercised without opening a socket.
 
-use std::{io::Read, net::SocketAddr, thread::sleep, time::Duration};
+use std::{io::Read, net::SocketAddr, sync::Arc, thread::sleep, time::Duration};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde_json::json;
 use subtle::ConstantTimeEq;
 
 use crate::{
+    diagnostics::{Diagnostics, Snapshot},
     ftp::FtpTransport,
     http::Url,
     web::{
@@ -142,6 +143,7 @@ pub struct AppState<T> {
     pub config: WebConfig,
     pub files: FtpFiles<T>,
     pub thumbnails: Thumbnails,
+    pub diagnostics: Arc<Diagnostics>,
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -211,6 +213,13 @@ pub fn handle<T: FtpTransport>(
             }
         }
 
+        (Some(Method::Get), "/api/status") => {
+            /* Deliberately reads nothing but values already in memory. A status route that had to
+             * ask the FTP server anything would be stuck in exactly the situation somebody is
+             * loading it to understand. */
+            Response::json(200, &status_json(&state.diagnostics.snapshot()))
+        }
+
         (Some(Method::Get), "/api/photo") => {
             let path = raw(&url, "path");
             match state.files.read(&path) {
@@ -272,7 +281,7 @@ pub fn handle<T: FtpTransport>(
 
         /* A known route reached with the wrong verb, which for the mutating ones is what an <img>
          * pointed at the delete route would look like */
-        (_, "/" | "/api/list" | "/api/thumbnail" | "/api/photo") => {
+        (_, "/" | "/api/list" | "/api/thumbnail" | "/api/photo" | "/api/status") => {
             Response::error(405, "That address does not accept this kind of request")
         }
         (_, "/api/upload" | "/api/delete" | "/api/mkdir" | "/api/rmdir") => {
@@ -280,6 +289,33 @@ pub fn handle<T: FtpTransport>(
         }
         _ => Response::error(404, "No such address"),
     }
+}
+
+/// The status as the page and a soak test both read it.
+///
+/// Ages rather than timestamps: the question being asked is always "has this been stuck", and an
+/// age answers it without anyone doing arithmetic against a clock that may not even agree.
+fn status_json(snapshot: &Snapshot) -> serde_json::Value {
+    json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "features": {
+            "web": true,
+            "ftps": cfg!(feature = "ftps"),
+            "motion_sensor": cfg!(feature = "motion-sensor"),
+        },
+        "uptime_seconds": snapshot.uptime.as_secs(),
+        "threads": snapshot.threads.iter().map(|thread| json!({
+            "name": thread.name,
+            "doing": thread.doing,
+            "for_seconds": thread.for_.as_secs(),
+        })).collect::<Vec<_>>(),
+        "last_photo_shown_seconds_ago": snapshot
+            .last_photo_shown.as_ref().map(|event| event.ago.as_secs()),
+        "last_photo_fetched_seconds_ago": snapshot
+            .last_photo_fetched.as_ref().map(|event| event.ago.as_secs()),
+        "album_photos": snapshot.album_photos,
+        "waiting_for_a_photo": snapshot.waiting_for_a_photo,
+    })
 }
 
 /// Which of the two formats a photo is in.
@@ -464,6 +500,7 @@ mod tests {
                 Refresh::default(),
             ),
             thumbnails: Thumbnails::new(1024 * 1024),
+            diagnostics: Arc::new(Diagnostics::new()),
         }
     }
 
@@ -828,6 +865,43 @@ mod tests {
         );
 
         assert_eq!(response.status, 409);
+    }
+
+    /// The whole value of the route is that it answers when the FTP side cannot, so the mock is
+    /// given no expectations at all: any FTP call would panic the test rather than hang it
+    #[test]
+    fn handle_serves_the_status_without_touching_ftp() {
+        let state = state(MockFtpTransport::new());
+        state
+            .diagnostics
+            .doing(crate::diagnostics::FETCHER, "downloading a photo");
+        state.diagnostics.album(42, false);
+
+        let response = answer(&state, &request(Method::Get, "/api/status"));
+
+        assert_eq!(response.status, 200);
+        let body = body(&response);
+        assert_eq!(body["album_photos"], 42);
+        assert_eq!(body["waiting_for_a_photo"], false);
+        assert_eq!(body["threads"][0]["name"], "photo-fetcher");
+        assert_eq!(body["threads"][0]["doing"], "downloading a photo");
+        assert!(
+            body["threads"][0]["for_seconds"].is_number(),
+            "an age is the field the whole status exists for"
+        );
+        assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(body["features"]["web"], true);
+    }
+
+    #[test]
+    fn handle_serves_the_status_before_anything_has_been_reported() {
+        let response = answer(
+            &state(MockFtpTransport::new()),
+            &request(Method::Get, "/api/status"),
+        );
+
+        assert_eq!(response.status, 200, "an empty reading is still a reading");
+        assert_eq!(body(&response)["album_photos"], serde_json::Value::Null);
     }
 
     #[test]

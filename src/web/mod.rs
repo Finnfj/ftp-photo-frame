@@ -10,12 +10,14 @@ pub mod files;
 pub mod routes;
 pub mod thumbnails;
 
-use std::{io::Read, net::SocketAddr, time::Duration};
+use std::{io::Read, net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::{Result, anyhow};
 use tiny_http::{Header, Request, Response, Server};
 
 pub use crate::slideshow::Refresh;
+
+use crate::diagnostics::{Diagnostics, WEB};
 
 use crate::{
     ftp::{FtpSession, FtpTransport, SuppaFtpTransport},
@@ -40,11 +42,13 @@ pub fn state(
     session: FtpSession,
     timeout: Duration,
     refresh: Refresh,
+    diagnostics: Arc<Diagnostics>,
 ) -> AppState<SuppaFtpTransport> {
     AppState {
         config,
         files: FtpFiles::new(session, SuppaFtpTransport::new(timeout), refresh),
         thumbnails: Thumbnails::new(THUMBNAIL_CACHE_BYTES),
+        diagnostics,
     }
 }
 
@@ -73,8 +77,15 @@ pub fn bind(address: SocketAddr) -> Result<Server> {
 /// requests one after another is not a limitation but the shape of the problem; it also means the
 /// gallery cannot start ten downloads while an upload is running.
 pub fn serve<T: FtpTransport>(server: Server, state: AppState<T>) {
+    state.diagnostics.doing(WEB, "waiting for a request");
     for mut request in server.incoming_requests() {
         let description = format!("{} {}", request.method(), request.url());
+        /* The url, never the query: a path the browser asked for is fine to echo, but the
+         * parameters carry file names and this ends up on a page and in a soak test's output */
+        state.diagnostics.doing(
+            WEB,
+            format!("handling {} {}", request.method(), path_of(&request)),
+        );
         let response = match head_of(&request) {
             Err(response) => response,
             Ok(head) => {
@@ -86,7 +97,14 @@ pub fn serve<T: FtpTransport>(server: Server, state: AppState<T>) {
         };
         log::debug!("{description} -> {}", response.status);
         respond(request, response);
+        state.diagnostics.doing(WEB, "waiting for a request");
     }
+}
+
+/// The path without the query string, which is where the file names live
+fn path_of(request: &Request) -> &str {
+    let url = request.url();
+    url.split('?').next().unwrap_or(url)
 }
 
 /// Turns what [tiny_http] hands over into the plain value [routes::handle] works on
@@ -191,6 +209,7 @@ mod tests {
             },
             files: FtpFiles::new(fake_session(), transport, refresh.clone()),
             thumbnails: Thumbnails::new(1024 * 1024),
+            diagnostics: Arc::new(Diagnostics::new()),
         };
         std::thread::spawn(move || serve(server, state));
         (address, refresh)
@@ -273,6 +292,7 @@ mod tests {
             },
             files: FtpFiles::new(fake_session(), transport, Refresh::default()),
             thumbnails: Thumbnails::new(1024 * 1024),
+            diagnostics: Arc::new(Diagnostics::new()),
         };
         println!("Open http://127.0.0.1:8099/ and log in as {USER} / {PASSWORD}");
         serve(server, state);

@@ -188,6 +188,20 @@
 
   .tile img { cursor: zoom-in; }
 
+  #status {
+    margin: 0 0 1rem;
+    padding: .75rem 1rem;
+    border: 1px solid var(--border);
+    border-radius: .6rem;
+    background: var(--surface);
+    font-size: .85rem;
+  }
+  #status h2 { margin: 0 0 .5rem; font-size: .9rem; }
+  #status dl { display: grid; grid-template-columns: auto 1fr; gap: .25rem .75rem; margin: 0; }
+  #status dt { color: var(--muted); white-space: nowrap; }
+  #status dd { margin: 0; overflow-wrap: anywhere; }
+  #status .stuck { color: var(--danger); }
+
   #viewer {
     position: fixed;
     inset: 0;
@@ -220,10 +234,15 @@
     <input id="file-input" type="file" multiple accept="image/jpeg,image/png,.jpg,.jpeg,.png">
     <button class="button" id="new-folder">New folder</button>
     <button class="button danger" id="remove-folder" hidden>Delete this folder</button>
+    <button class="button" id="toggle-status">Status</button>
   </div>
 </header>
 
 <main>
+  <section id="status" hidden aria-live="polite">
+    <h2>What the frame is doing</h2>
+    <dl></dl>
+  </section>
   <ul id="folders"></ul>
   <div id="grid"></div>
   <div id="empty" hidden>This folder is empty.</div>
@@ -279,6 +298,9 @@
     viewerName: document.querySelector('#viewer .name'),
     viewerDownload: document.getElementById('viewer-download'),
     viewerClose: document.getElementById('viewer-close'),
+    status: document.getElementById('status'),
+    statusList: document.querySelector('#status dl'),
+    toggleStatus: document.getElementById('toggle-status'),
   };
 
   /* Path of the folder on screen, relative to the shared directory, "" for the shared directory
@@ -477,6 +499,57 @@
     el.viewerImage.removeAttribute('src');
   }
 
+  /* How long a thread has to have been on one thing before it is worth pointing at. Fetching a
+   * photo over a slow link legitimately takes seconds; minutes means something is wrong. */
+  const STUCK_SECONDS = 120;
+
+  function describeAge(seconds) {
+    if (seconds === null || seconds === undefined) return 'never';
+    if (seconds < 60) return `${seconds}s ago`;
+    if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
+    return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m ago`;
+  }
+
+  function describeFor(seconds) {
+    if (seconds < 60) return `for ${seconds}s`;
+    if (seconds < 3600) return `for ${Math.floor(seconds / 60)}m`;
+    return `for ${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
+  }
+
+  function renderStatus(status) {
+    const rows = [];
+    for (const thread of status.threads) {
+      rows.push([thread.name, `${thread.doing} ${describeFor(thread.for_seconds)}`,
+        thread.for_seconds >= STUCK_SECONDS]);
+    }
+    rows.push(['last photo shown', describeAge(status.last_photo_shown_seconds_ago), false]);
+    rows.push(['last photo fetched', describeAge(status.last_photo_fetched_seconds_ago), false]);
+    rows.push(['photos in album',
+      status.album_photos === null ? 'not listed yet' : String(status.album_photos), false]);
+    if (status.waiting_for_a_photo) rows.push(['album', 'empty, waiting for an upload', true]);
+    rows.push(['uptime', describeFor(status.uptime_seconds).replace('for ', ''), false]);
+    rows.push(['version', status.version, false]);
+
+    el.statusList.replaceChildren();
+    for (const [label, value, stuck] of rows) {
+      const dt = document.createElement('dt');
+      dt.textContent = label;
+      const dd = document.createElement('dd');
+      dd.textContent = value;
+      if (stuck) dd.className = 'stuck';
+      el.statusList.append(dt, dd);
+    }
+  }
+
+  async function refreshStatus() {
+    if (el.status.hidden) return;
+    try {
+      renderStatus(await request('GET', '/api/status', {}));
+    } catch (error) {
+      showError(error);
+    }
+  }
+
   function showError(error) {
     el.toast.textContent = error.message;
     el.toast.hidden = false;
@@ -576,6 +649,13 @@
   el.fileInput.onchange = () => {
     if (el.fileInput.files.length > 0) uploadAll([...el.fileInput.files]);
   };
+  el.toggleStatus.onclick = () => {
+    el.status.hidden = !el.status.hidden;
+    refreshStatus();
+  };
+  /* Cheap enough to poll: the route reads values already in memory and touches no FTP */
+  setInterval(refreshStatus, 5000);
+
   el.viewerClose.onclick = closeViewer;
   /* The bar is excluded so that reaching for Download does not dismiss the thing being downloaded */
   el.viewer.onclick = (event) => {

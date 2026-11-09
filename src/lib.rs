@@ -8,7 +8,10 @@ pub use {api_client::LoginError, rand::RandomImpl};
 use std::{
     error::Error,
     fmt::{Display, Formatter},
-    sync::mpsc::{self, Receiver, SyncSender, TryRecvError},
+    sync::{
+        Arc,
+        mpsc::{self, Receiver, SyncSender, TryRecvError},
+    },
     thread::{self, Scope, ScopedJoinHandle},
     time::Duration,
 };
@@ -27,6 +30,7 @@ use crate::{
         syno_client::SynoApiClient,
     },
     cli::{Backend, Cli},
+    diagnostics::{DISPLAY, Diagnostics, FETCHER},
     env::Env,
     ftp::SuppaFtpTransport,
     http::{CookieStore, HttpClient},
@@ -40,6 +44,7 @@ use crate::{
 };
 
 pub mod cli;
+pub mod diagnostics;
 pub mod env;
 pub mod error;
 pub mod ftp;
@@ -82,6 +87,7 @@ where
     R: Random + Send,
 {
     let current_image = show_welcome_screen(cli, sdl)?;
+    let diagnostics = Arc::new(Diagnostics::new());
 
     thread::scope::<'_, _, Result<()>>(|thread_scope| {
         let (update_check_sender, update_check_receiver) = mpsc::sync_channel(1);
@@ -103,6 +109,7 @@ where
             current_image,
             env,
             standby,
+            diagnostics,
         )
     })
 }
@@ -138,6 +145,7 @@ fn select_backend_and_start_slideshow<H, R>(
     current_image: DynamicImage,
     env: &impl Env,
     standby: Standby,
+    diagnostics: Arc<Diagnostics>,
 ) -> Result<()>
 where
     H: HttpClient + Sync,
@@ -168,6 +176,7 @@ where
             env,
             standby,
             None,
+            diagnostics,
         ),
         Backend::Immich => slideshow_loop(
             cli,
@@ -179,6 +188,7 @@ where
             env,
             standby,
             None,
+            diagnostics,
         ),
         Backend::Ftp => {
             let api_client = FtpApiClient::build(
@@ -186,7 +196,7 @@ where
                 &cli.share_link,
             )?
             .with_password(&cli.password);
-            let refresh = start_web_app(cli, &api_client)?;
+            let refresh = start_web_app(cli, &api_client, Arc::clone(&diagnostics))?;
             slideshow_loop(
                 cli,
                 api_client,
@@ -197,6 +207,7 @@ where
                 env,
                 standby,
                 refresh,
+                diagnostics,
             )
         }
         Backend::Auto => unreachable!(),
@@ -209,6 +220,7 @@ where
 fn start_web_app<T: crate::ftp::FtpTransport>(
     cli: &Cli,
     api_client: &FtpApiClient<T>,
+    diagnostics: Arc<Diagnostics>,
 ) -> Result<Option<Refresh>> {
     let Some(password) = &cli.web_password else {
         return Ok(None);
@@ -227,6 +239,7 @@ fn start_web_app<T: crate::ftp::FtpTransport>(
         api_client.session(),
         Duration::from_secs(cli.timeout_seconds.into()),
         refresh.clone(),
+        diagnostics,
     );
     thread::Builder::new()
         .name("web".to_string())
@@ -235,7 +248,11 @@ fn start_web_app<T: crate::ftp::FtpTransport>(
 }
 
 #[cfg(not(feature = "web"))]
-fn start_web_app<T>(cli: &Cli, _: &FtpApiClient<T>) -> Result<Option<Refresh>> {
+fn start_web_app<T>(
+    cli: &Cli,
+    _: &FtpApiClient<T>,
+    _: Arc<Diagnostics>,
+) -> Result<Option<Refresh>> {
     if cli.web_password.is_some() {
         bail!(
             "--web-password requires a build with web app support. Reinstall with \
@@ -256,6 +273,7 @@ fn slideshow_loop<A, R>(
     env: &impl Env,
     mut standby: Standby,
     refresh: Option<Refresh>,
+    diagnostics: Arc<Diagnostics>,
 ) -> Result<()>
 where
     A: ApiClient + Send,
@@ -277,12 +295,14 @@ where
             photo_sender,
             env,
             refresh,
+            Arc::clone(&diagnostics),
         )?;
 
         let loop_result = loop {
             sdl.handle_quit_event()?;
 
             if standby.update() == DisplayState::Asleep {
+                diagnostics.doing(DISPLAY, "display asleep, nobody is watching");
                 /* Nobody is watching, so the slideshow pauses along with the display. The photo
                  * fetching thread blocks on its own once it has filled the channel. last_change is
                  * deliberately left alone: by the time somebody shows up again its interval has
@@ -308,6 +328,7 @@ where
                 Ok(next_photo_result) => next_photo_result,
                 Err(TryRecvError::Empty) => {
                     /* next photo is still being fetched and processed, we have to wait for it */
+                    diagnostics.doing(DISPLAY, "waiting for the next photo to be ready");
                     thread_sleep(LOOP_SLEEP_DURATION);
                     continue;
                 }
@@ -355,6 +376,8 @@ where
 
                 sdl.swap_textures();
                 current_image = next_photo.image;
+                diagnostics.doing(DISPLAY, "showing a photo");
+                diagnostics.photo_shown("a photo");
             }
         };
         if loop_result.is_err() {
@@ -375,6 +398,7 @@ fn photo_fetcher_thread<'a, A, R>(
     photo_sender: SyncSender<Result<DynamicImagePhoto>>,
     env: &impl Env,
     refresh: Option<Refresh>,
+    diagnostics: Arc<Diagnostics>,
 ) -> Result<ScopedJoinHandle<'a, ()>>
 where
     A: ApiClient + Send + 'a,
@@ -392,12 +416,16 @@ where
     .with_ordering(cli.order)
     .with_random_start(cli.random_start)
     .with_source_size(cli.source_size)
-    .with_refresh(refresh);
+    .with_refresh(refresh)
+    .with_diagnostics(Some(Arc::clone(&diagnostics)));
     Ok(thread::Builder::new()
         .name("photo-fetcher".to_string())
         .spawn_scoped(thread_scope, move || {
             loop {
+                diagnostics.doing(FETCHER, "fetching the next photo");
                 let photo_result = slideshow.get_next_photo().and_then(|photo| {
+                    diagnostics.photo_fetched("a photo");
+                    diagnostics.doing(FETCHER, "decoding and scaling the photo");
                     load_image_from_memory(&photo.bytes).map(|image| {
                         DynamicImagePhoto::new(
                             image.fit_to_screen_and_add_background(
@@ -409,7 +437,10 @@ where
                         )
                     })
                 });
-                /* Blocks until photo is received by the main thread */
+                /* Blocks until photo is received by the main thread. Reported because it is a
+                 * perfectly healthy place to sit for a whole interval, and a status that did not
+                 * say so would look like a stall every time somebody looked. */
+                diagnostics.doing(FETCHER, "waiting for the display to take the photo");
                 let send_result = photo_sender.send(photo_result);
                 if send_result.is_err() {
                     break;
