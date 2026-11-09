@@ -366,7 +366,44 @@ Pi](https://pimylifeup.com/raspberry-pi-swap-file/).
 
 ### Auto-start
 
-To start the slideshow automatically on boot, you can add it to
+#### With systemd (recommended when installed from the Debian package)
+
+The package installs a service, but deliberately leaves it switched off:
+the frame cannot start without a share link, and an enabled service
+without one would restart every ten seconds until somebody noticed. So
+configure it first:
+
+```bash
+sudo nano /etc/default/syno-photo-frame
+```
+
+Put the share link and any options on the `SYNO_PHOTO_FRAME_ARGS` line,
+and passwords on the variables below it rather than in options, so they
+do not appear in the process list. Then:
+
+```bash
+sudo systemctl enable --now syno-photo-frame
+journalctl -u syno-photo-frame -f
+```
+
+The service runs as the `pi` user; change that with `sudo systemctl edit
+syno-photo-frame` if yours is called something else. It restarts on
+failure but not after a clean exit, and it deliberately has no watchdog:
+restarting a frame that has frozen also throws away the evidence of why
+it froze.
+
+If you installed by copying the binary rather than from the package, the
+unit and its configuration file are in the repository under `dpkg/`:
+
+```bash
+sudo cp dpkg/syno-photo-frame.service /etc/systemd/system/
+sudo cp dpkg/syno-photo-frame.default /etc/default/syno-photo-frame
+sudo systemctl daemon-reload
+```
+
+#### With crontab
+
+To start the slideshow automatically on boot, you can instead add it to
 crontab:
 
 ```bash

@@ -1,0 +1,11 @@
+#!/bin/sh
+set -e
+
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload || true
+fi
+if [ "$1" = "purge" ] && [ -d /run/systemd/system ]; then
+    systemctl disable syno-photo-frame.service >/dev/null 2>&1 || true
+fi
+
+exit 0

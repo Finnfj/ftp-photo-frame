@@ -28,7 +28,16 @@ pub struct Cli {
     pub share_link: Url,
 
     /// Link protection password if set in the album sharing settings, or the FTP account's password
-    #[arg(short = 'p', long = "password")]
+    ///
+    /// Prefer the environment variable, for the same reason --web-password already advises it: a
+    /// password given on the command line is visible to every other user of the machine in the
+    /// process list. The systemd unit passes it this way.
+    #[arg(
+        short = 'p',
+        long = "password",
+        env = "SYNO_PHOTO_FRAME_PASSWORD",
+        hide_env_values = true
+    )]
     pub password: Option<String>,
 
     /// Photo change interval in seconds

@@ -1,0 +1,33 @@
+# Configuration for the syno-photo-frame systemd service.
+#
+# Everything the frame is told lives on one line, because that is how it is told: the program
+# takes a share link and options, and the service passes this through unchanged.
+#
+# After editing:   sudo systemctl restart syno-photo-frame
+# To see the logs: journalctl -u syno-photo-frame -f
+
+# The share link comes first, then any options. Run `syno-photo-frame --help` for the full list.
+#
+# Synology Photos:
+#SYNO_PHOTO_FRAME_ARGS="https://your.nas/photo/mo/sharing/AbCdEfGh --interval 60"
+#
+# Immich:
+#SYNO_PHOTO_FRAME_ARGS="https://your.immich/share/AbCdEfGh --interval 60"
+#
+# FTP server (the password goes in SYNO_PHOTO_FRAME_PASSWORD below, not here, so that it stays
+# out of the process list):
+#SYNO_PHOTO_FRAME_ARGS="ftp://user@your.nas/path/to/photos --interval 60"
+SYNO_PHOTO_FRAME_ARGS=""
+
+# The FTP account's password, or an album's link-protection password. Kept here rather than in
+# --password so that it does not show up in `ps`.
+#SYNO_PHOTO_FRAME_PASSWORD=
+
+# Password for the local-network web app, which is also what switches it on. Only the FTP backend
+# supports it. The connection is not encrypted, so use a password you use nowhere else.
+#SYNO_PHOTO_FRAME_WEB_PASSWORD=
+
+# How much the frame writes to the journal. The default is info; debug adds a line before and
+# after every download, listing and upload, which is what makes a transfer that started and never
+# finished visible. Worth turning on while chasing a frame that stops.
+#RUST_LOG=debug

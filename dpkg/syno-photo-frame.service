@@ -1,0 +1,37 @@
+[Unit]
+Description=Full-screen photo frame slideshow
+Documentation=https://github.com/Caleb9/syno-photo-frame
+# The album lives on a server, so starting before the network is up only produces a login error
+# and a restart. network-online.target is the one that actually waits for an address.
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+# The share link and every option live here, so that changing them is not editing a unit file.
+# The package ships it with examples and dpkg will not overwrite your edits on upgrade.
+EnvironmentFile=/etc/default/syno-photo-frame
+ExecStart=/usr/bin/syno-photo-frame $SYNO_PHOTO_FRAME_ARGS
+
+# Drawing to the screen of a CLI-only system needs the video devices, which this user has through
+# its groups rather than by being root. Change the user with `systemctl edit syno-photo-frame`
+# if yours is not called pi.
+User=pi
+SupplementaryGroups=video render input tty
+
+# A frame that has exited is a frame showing nothing, so bring it back -- but only on failure.
+# Quitting on purpose, which the program reports as a clean exit, must stay quit.
+Restart=on-failure
+RestartSec=10
+
+# Deliberately no WatchdogSec. A watchdog that restarts a wedged frame also destroys the evidence
+# of why it wedged, and an occasional hang you cannot reproduce is one you have to catch in a log.
+# See docs/adr/ for the reasoning. Revisit once a hang has actually been diagnosed.
+
+# Output goes to the journal, which is what makes `journalctl -u syno-photo-frame` the one place
+# to look. Raise the detail with RUST_LOG in /etc/default/syno-photo-frame.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

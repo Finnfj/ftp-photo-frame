@@ -1,0 +1,16 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = "configure" ]; then
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload || true
+    fi
+    # Deliberately not enabled here. The frame cannot start without a share link, and an enabled
+    # service with none would restart-loop every ten seconds until somebody noticed.
+    if [ -z "$2" ]; then
+        echo "syno-photo-frame: edit /etc/default/syno-photo-frame, then run"
+        echo "  sudo systemctl enable --now syno-photo-frame"
+    fi
+fi
+
+exit 0
