@@ -211,6 +211,20 @@
     object-fit: contain;
     padding: 0 1rem calc(1rem + env(safe-area-inset-bottom));
   }
+  /* Until the photo has arrived there is nothing to show and nothing to dismiss. Hiding the image
+   * rather than leaving it empty is what stops a tap on the blank area from closing the viewer and
+   * cancelling the download with it -- which looked exactly like the photo failing to load. */
+  #viewer:not([data-state="loaded"]) img { display: none; }
+  #viewer .state {
+    flex: 1;
+    display: grid;
+    place-items: center;
+    padding: 0 1rem;
+    text-align: center;
+    color: var(--muted);
+  }
+  #viewer[data-state="loaded"] .state { display: none; }
+  #viewer[data-state="failed"] .state { color: var(--danger); }
 </style>
 
 <header>
@@ -242,6 +256,7 @@
     <button class="button" id="viewer-close">Close</button>
   </div>
   <img alt="">
+  <p class="state"></p>
 </div>
 
 <div id="toast" hidden role="alert"></div>
@@ -276,6 +291,7 @@
     toast: document.getElementById('toast'),
     viewer: document.getElementById('viewer'),
     viewerImage: document.querySelector('#viewer img'),
+    viewerState: document.querySelector('#viewer .state'),
     viewerName: document.querySelector('#viewer .name'),
     viewerDownload: document.getElementById('viewer-download'),
     viewerClose: document.getElementById('viewer-close'),
@@ -463,16 +479,27 @@
    * than having the frame scale a second size, and it doubles as the download. */
   function openViewer(path, name) {
     const source = url('/api/photo', { path });
-    el.viewerImage.src = source;
-    el.viewerImage.alt = name;
+    /* A full-size photo off a NAS takes seconds, and the frame serves one request at a time, so
+     * the wait is real and has to be visible. Without it the viewer is a black rectangle and the
+     * obvious reaction -- tapping it -- used to cancel the download. */
+    el.viewer.dataset.state = 'loading';
+    el.viewerState.textContent = `Loading ${name}…`;
     el.viewerName.textContent = name;
     el.viewerDownload.href = source;
     el.viewerDownload.setAttribute('download', name);
+    el.viewerImage.alt = name;
+    el.viewerImage.onload = () => { el.viewer.dataset.state = 'loaded'; };
+    el.viewerImage.onerror = () => {
+      el.viewer.dataset.state = 'failed';
+      el.viewerState.textContent = `${name} could not be loaded.`;
+    };
+    el.viewerImage.src = source;
     el.viewer.hidden = false;
   }
 
   function closeViewer() {
     el.viewer.hidden = true;
+    el.viewer.dataset.state = 'loading';
     /* Stops a photo nobody is looking at any more from going on downloading */
     el.viewerImage.removeAttribute('src');
   }
@@ -577,7 +604,9 @@
     if (el.fileInput.files.length > 0) uploadAll([...el.fileInput.files]);
   };
   el.viewerClose.onclick = closeViewer;
-  /* The bar is excluded so that reaching for Download does not dismiss the thing being downloaded */
+  /* The bar is excluded so that reaching for Download does not dismiss the thing being
+   * downloaded. The image is only in the page once it has loaded, so a tap while waiting lands on
+   * the status text and does nothing, which is what it should do. */
   el.viewer.onclick = (event) => {
     if (event.target === el.viewer || event.target === el.viewerImage) closeViewer();
   };
