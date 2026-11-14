@@ -19,6 +19,12 @@ use crate::{
     },
 };
 
+/// How much of a photo to fetch when looking for the preview a camera embedded in it.
+///
+/// The preview sits in the EXIF block near the start of the file. 128 KiB is generous for that and
+/// still a fortieth of a typical photo from a drone or a decent camera.
+const PREVIEW_HEAD_BYTES: usize = 128 * 1024;
+
 /// Required on every request that changes something.
 ///
 /// This is what stops another site from having the browser delete photos: HTTP Basic credentials
@@ -207,7 +213,11 @@ pub fn handle<T: FtpTransport>(
 
         (Some(Method::Get), "/api/thumbnail") => {
             let path = raw(&url, "path");
-            match state.thumbnails.get(&path, || state.files.read(&path)) {
+            match state.thumbnails.get(
+                &path,
+                || state.files.read_head(&path, PREVIEW_HEAD_BYTES),
+                || state.files.read(&path),
+            ) {
                 Ok(bytes) => Response::thumbnail(bytes.to_vec()),
                 Err(error) => failed(error),
             }
@@ -949,6 +959,13 @@ mod tests {
     fn handle_serves_a_thumbnail_as_jpeg_that_the_browser_may_keep() {
         let mut transport = MockFtpTransport::new();
         transport.expect_is_connected().return_const(true);
+        /* The start of the file is asked for first, every time. This test photo carries no
+         * embedded preview, so the whole of it is fetched after that; a photo that has one never
+         * reaches the second call, which is the point of the arrangement. */
+        transport
+            .expect_retrieve_head()
+            .withf(|_, max| *max == PREVIEW_HEAD_BYTES)
+            .return_once(|_, _| Ok(Bytes::from_static(crate::web::thumbnails::TEST_JPEG)));
         transport
             .expect_retrieve()
             .return_once(|_| Ok(Bytes::from_static(crate::web::thumbnails::TEST_JPEG)));
