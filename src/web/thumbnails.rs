@@ -7,8 +7,8 @@
 
 use std::{
     collections::VecDeque,
-    fs,
-    io::Cursor,
+    fs::{self, File},
+    io::{Cursor, Write as _},
     path::{Path, PathBuf},
     sync::atomic::{AtomicUsize, Ordering as AtomicOrdering},
     sync::{Mutex, MutexGuard, PoisonError},
@@ -97,6 +97,10 @@ impl Thumbnails {
                 render(&load_all()?)?
             }
         };
+        /* Nothing should be able to encode to no bytes, but a thumbnail that is empty is
+         * indistinguishable from a broken one once it has been cached, so it stops here as a
+         * visible error rather than becoming a tile that silently never loads. */
+        anyhow::ensure!(!thumbnail.is_empty(), "rendering {key} produced no image");
         let thumbnail = Bytes::from(thumbnail);
         if let Some(disk) = &self.disk {
             disk.write(key, &thumbnail);
@@ -190,6 +194,15 @@ impl DiskCache {
     fn read(&self, key: &str) -> Option<Bytes> {
         let file = self.file_for(key)?;
         match fs::read(&file) {
+            /* A file with nothing in it is not a thumbnail, and treating it as a hit would serve
+             * an empty image for that photo for ever: every later request is answered by the empty
+             * file, so the entry can never be replaced by a real one. Dropping it costs one render
+             * and ends the problem, which is worth it for something a power cut can leave behind. */
+            Ok(bytes) if bytes.is_empty() => {
+                log::debug!("Dropping the empty cache entry for {key}");
+                let _ = fs::remove_file(&file);
+                None
+            }
             Ok(bytes) => Some(Bytes::from(bytes)),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => {
@@ -200,28 +213,46 @@ impl DiskCache {
     }
 
     fn write(&self, key: &str, thumbnail: &[u8]) {
+        /* Storing nothing would be storing a permanently broken thumbnail: see `read` */
+        if thumbnail.is_empty() {
+            return;
+        }
         let Some(file) = self.file_for(key) else {
+            return;
+        };
+        let Some(name) = file.file_name().and_then(|name| name.to_str()) else {
             return;
         };
         if let Err(error) = fs::create_dir_all(&self.directory) {
             log::debug!("Could not make {}: {error}", self.directory.display());
             return;
         }
+        let writes = self.writes.fetch_add(1, AtomicOrdering::Relaxed);
         /* Written beside the real name and moved onto it, so that a frame stopped mid-write never
-         * leaves behind half a thumbnail that would be served as if it were whole */
-        let partial = file.with_extension("partial");
-        if let Err(error) =
-            fs::write(&partial, thumbnail).and_then(|()| fs::rename(&partial, &file))
-        {
+         * leaves behind half a thumbnail that would be served as if it were whole.
+         *
+         * The temporary name counts up rather than being derived from the key alone. Two requests
+         * for the same photo can miss together, and one shared temporary file would let the second
+         * truncate what the first is about to rename into place -- publishing an empty thumbnail
+         * through the very mechanism meant to prevent one. */
+        let partial = self.directory.join(format!("{name}.{writes}.partial"));
+        let stored = File::create(&partial)
+            .and_then(|mut partial| {
+                partial.write_all(thumbnail)?;
+                /* The bytes have to reach the card before the name does. A rename is atomic
+                 * against the data already written, not against data still in the page cache, so
+                 * without this a frame that loses power can come back with the new name in place
+                 * and nothing behind it. This frame is only ever switched off at the wall, so that
+                 * is the normal ending rather than a rare one. */
+                partial.sync_all()
+            })
+            .and_then(|()| fs::rename(&partial, &file));
+        if let Err(error) = stored {
             log::debug!("Could not keep {}: {error}", file.display());
             let _ = fs::remove_file(&partial);
             return;
         }
-        if self
-            .writes
-            .fetch_add(1, AtomicOrdering::Relaxed)
-            .is_multiple_of(WRITES_BETWEEN_PRUNES)
-        {
+        if writes.is_multiple_of(WRITES_BETWEEN_PRUNES) {
             self.prune();
         }
     }
@@ -763,6 +794,94 @@ mod tests {
         let _ = fs::remove_dir_all(&directory);
         fs::create_dir_all(&directory).expect("a temporary directory has to be creatable");
         directory
+    }
+
+    /// A real frame was found with 23 empty files in its cache, and every one of them was a photo
+    /// whose tile never loaded again: the empty file answered every later request, so the entry
+    /// could never repair itself. An entry with no bytes has to be treated as no entry.
+    #[test]
+    fn an_empty_cache_entry_is_rendered_again_rather_than_served() {
+        let directory = temporary_directory("empty-entry");
+        let disk = DiskCache::new(directory.clone(), 1024 * 1024);
+        let file = disk
+            .file_for("holiday/a.jpg")
+            .expect("the key fits in a file name");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(&file, b"").expect("an empty entry is what a power cut can leave behind");
+
+        let thumbnails =
+            Thumbnails::new(1024 * 1024).with_disk_cache(directory.clone(), 1024 * 1024);
+        let loads = AtomicUsize::new(0);
+        let count = || {
+            loads.fetch_add(1, Ordering::Relaxed);
+            Ok(Bytes::from_static(TEST_JPEG))
+        };
+        let thumbnail = thumbnails.get("holiday/a.jpg", count, count).unwrap();
+
+        assert!(!thumbnail.is_empty(), "an empty entry must not be served");
+        assert!(
+            loads.load(Ordering::Relaxed) > 0,
+            "it had to fetch the photo rather than trust the empty file"
+        );
+        assert!(
+            fs::metadata(&file).is_ok_and(|file| file.len() > 0),
+            "the empty entry should have been replaced by a real one"
+        );
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn an_empty_thumbnail_is_never_kept() {
+        let directory = temporary_directory("empty-write");
+        let disk = DiskCache::new(directory.clone(), 1024 * 1024);
+
+        disk.write("a.jpg", b"");
+
+        assert!(
+            disk.read("a.jpg").is_none(),
+            "storing nothing stores a tile that can never load"
+        );
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    /// Two requests for the same photo can miss together. When both write through one shared
+    /// temporary file, one truncates what the other is about to rename into place, and the loser
+    /// publishes an empty or half-written thumbnail.
+    #[test]
+    fn writing_the_same_key_from_several_threads_leaves_a_whole_thumbnail() {
+        let directory = temporary_directory("concurrent-write");
+        let disk = DiskCache::new(directory.clone(), 1024 * 1024);
+        let lengths = [1024, 4096, 16384];
+
+        std::thread::scope(|scope| {
+            for (n, length) in lengths.iter().enumerate() {
+                let disk = &disk;
+                scope.spawn(move || {
+                    for _ in 0..40 {
+                        disk.write("a.jpg", &vec![b'a' + n as u8; *length]);
+                    }
+                });
+            }
+        });
+
+        let kept = disk
+            .read("a.jpg")
+            .expect("one of the writes has to have won");
+        assert!(
+            lengths.contains(&kept.len()),
+            "a partly written thumbnail was published, {} bytes",
+            kept.len()
+        );
+        let leftovers: Vec<_> = fs::read_dir(&directory)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().extension().is_some_and(|end| end == "partial"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temporary files were left behind: {leftovers:?}"
+        );
+        let _ = fs::remove_dir_all(&directory);
     }
 
     /// The reason the disk cache exists: a frame restarts, and the photos that have to be fetched
