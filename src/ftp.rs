@@ -43,6 +43,14 @@ pub trait FtpTransport {
     /// Downloads a file in binary mode
     fn retrieve(&mut self, path: &str) -> Result<Bytes>;
 
+    /// Downloads at most `max_bytes` from the start of a file, stopping the transfer early.
+    ///
+    /// A thumbnail only needs the preview a camera embeds in a photo's metadata, which sits in the
+    /// first few kilobytes. Downloading the whole file for it costs a second per photo on a
+    /// megabyte-sized one, and a gallery is nothing but photos.
+    #[cfg(feature = "web")]
+    fn retrieve_head(&mut self, path: &str, max_bytes: usize) -> Result<Bytes>;
+
     /// Uploads a file in binary mode, reading it from `source`, and answers with the number of
     /// bytes the server accepted.
     ///
@@ -359,6 +367,48 @@ impl FtpTransport for SuppaFtpTransport {
 
     /* Like RETR, these all take the remainder of the command line as the path, so an absolute one
      * with spaces in it passes through unchanged */
+
+    /// Aborting a transfer leaves the session unusable, so it is dropped rather than reused.
+    ///
+    /// RFC 959 lets a server answer ABOR with more than one reply, and this one does: "226 closing
+    /// data connection" followed by "225 ABOR command successful". suppaftp reads a single reply,
+    /// so the other stays queued and the next command reads that instead of its own answer.
+    ///
+    /// There is no way to drain it. Every command sends one request and reads one reply, so a
+    /// NOOP meant to soak up the leftover produces a leftover of its own -- an attempt at exactly
+    /// that turned a stale "225" into a stale "200" and fixed nothing. Dropping the connection
+    /// costs a login on the next operation, tens of milliseconds against the second that fetching
+    /// a whole photo would have cost, and it is certain rather than hopeful.
+    #[cfg(feature = "web")]
+    fn retrieve_head(&mut self, path: &str, max_bytes: usize) -> Result<Bytes> {
+        use std::io::Read;
+
+        log::debug!("Downloading the first {max_bytes} bytes of {path}");
+        let mut buffer = Vec::with_capacity(max_bytes);
+        let stream = self.stream_mut()?.retr_as_stream(path).map_err(map_error)?;
+        let mut limited = stream.take(max_bytes as u64);
+        let read = limited.read_to_end(&mut buffer);
+        let stream = limited.into_inner();
+
+        /* Reading fewer bytes than asked for means the file ended, so the transfer finished on its
+         * own and the server is waiting to say so. Otherwise it is still sending and has to be
+         * told to stop, which is what ABOR is for: without it the control connection is left with
+         * a reply nobody read, and every later command sees the wrong one. */
+        let complete = matches!(&read, Ok(n) if *n < max_bytes);
+        let ended = if complete {
+            self.stream_mut()?.finalize_retr_stream(stream)
+        } else {
+            let aborted = self.stream_mut()?.abort(stream);
+            /* The session cannot be trusted after this; see spoiled_by_abort below */
+            self.disconnect();
+            aborted
+        };
+        read.map_err(|error| anyhow!("Reading {path} failed: {error}"))?;
+        ended.map_err(map_error)?;
+
+        log::debug!("Downloaded {} bytes from the start of {path}", buffer.len());
+        Ok(Bytes::from(buffer))
+    }
 
     #[cfg(feature = "web")]
     fn store(&mut self, path: &str, mut source: &mut dyn std::io::Read) -> Result<u64> {

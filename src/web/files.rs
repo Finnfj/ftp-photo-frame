@@ -150,6 +150,12 @@ impl<T: FtpTransport> FtpFiles<T> {
         self.retrying(|transport| transport.retrieve(&path))
     }
 
+    /// Downloads only the beginning of a photo, which is where the embedded preview lives
+    pub fn read_head(&self, photo: &str, max_bytes: usize) -> Result<Bytes> {
+        let path = resolve_photo(&self.session.root, photo)?;
+        self.retrying(|transport| transport.retrieve_head(&path, max_bytes))
+    }
+
     /// Stores a photo, and answers with the name it ended up under, which differs from the one
     /// asked for when that was already taken.
     ///

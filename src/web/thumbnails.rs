@@ -45,11 +45,37 @@ impl Thumbnails {
     ///
     /// `load` fetches the photo itself and is only called on a miss, which is the expensive part:
     /// it is a download over FTP.
-    pub fn get(&self, key: &str, load: impl FnOnce() -> Result<Bytes>) -> Result<Bytes> {
+    pub fn get(
+        &self,
+        key: &str,
+        load_head: impl FnOnce() -> Result<Bytes>,
+        load_all: impl FnOnce() -> Result<Bytes>,
+    ) -> Result<Bytes> {
         if let Some(cached) = self.lock().take_recent(key) {
             return Ok(cached);
         }
-        let thumbnail = Bytes::from(render(&load()?)?);
+        /* Nearly every photo carries a preview in its first few kilobytes, and rendering from it
+         * takes single-digit milliseconds. Downloading the whole file instead cost about a second
+         * each on a Raspberry Pi reading a NAS, which for a gallery is the entire wait. The whole
+         * file is only fetched for the photos that have no usable preview. */
+        let from_head = match load_head() {
+            Ok(head) => render_embedded(&head),
+            /* Reading only part of a file asks more of a server than reading all of it, so when
+             * that goes wrong the photo is still perfectly fetchable the ordinary way. Giving up
+             * here would turn a slow tile into a broken one. */
+            Err(error) => {
+                log::debug!("Could not read the start of {key}: {error:#}");
+                None
+            }
+        };
+        let thumbnail = match from_head {
+            Some(thumbnail) => thumbnail,
+            None => {
+                log::debug!("No usable preview in the start of {key}, downloading all of it");
+                render(&load_all()?)?
+            }
+        };
+        let thumbnail = Bytes::from(thumbnail);
         self.lock().insert(key.to_string(), thumbnail.clone());
         Ok(thumbnail)
     }
@@ -145,21 +171,44 @@ fn render(photo: &[u8]) -> Result<Vec<u8>> {
         .read_from_container(&mut Cursor::new(photo))
         .ok();
 
-    let image = match exif.as_ref().and_then(embedded_thumbnail) {
+    let image = match exif.as_ref().and_then(usable_preview) {
         /* Free next to decoding the photo itself, which on a Pi costs a second or more */
-        Some(embedded) => match img::load_from_memory(embedded) {
-            Ok(image) if image.width().max(image.height()) >= MIN_EMBEDDED_SIZE => image,
-            Ok(_) => decode(photo)?,
-            Err(error) => {
-                log::debug!("Unusable embedded preview: {error}");
-                decode(photo)?
-            }
-        },
+        Some(image) => image,
         None => decode(photo)?,
     };
+    encode(image, exif.as_ref())
+}
 
+/// The thumbnail built from the preview the camera embedded, or [None] when the bytes given do not
+/// contain a usable one.
+///
+/// Takes only as much of the photo as the caller happens to have, so that the start of a file is
+/// enough. A truncated photo cannot be decoded, which is the point: this never falls back to
+/// decoding, it reports that it could not and leaves that decision to the caller.
+fn render_embedded(photo: &[u8]) -> Option<Vec<u8>> {
+    let exif = exif::Reader::new()
+        .read_from_container(&mut Cursor::new(photo))
+        .ok()?;
+    let image = usable_preview(&exif)?;
+    encode(image, Some(&exif)).ok()
+}
+
+/// The embedded preview, decoded, if there is one and it is not too small to be worth using
+fn usable_preview(exif: &exif::Exif) -> Option<DynamicImage> {
+    let embedded = embedded_thumbnail(exif)?;
+    match img::load_from_memory(embedded) {
+        Ok(image) if image.width().max(image.height()) >= MIN_EMBEDDED_SIZE => Some(image),
+        Ok(_) => None,
+        Err(error) => {
+            log::debug!("Unusable embedded preview: {error}");
+            None
+        }
+    }
+}
+
+fn encode(image: DynamicImage, exif: Option<&exif::Exif>) -> Result<Vec<u8>> {
     /* Applied after scaling down, so that the rotation works on the smaller image */
-    let image = orient(fit(image), exif.as_ref().map_or(1, orientation));
+    let image = orient(fit(image), exif.map_or(1, orientation));
 
     let mut thumbnail = vec![];
     JpegEncoder::new_with_quality(&mut thumbnail, JPEG_QUALITY)
@@ -299,23 +348,168 @@ mod tests {
 
     /* Cache */
 
+    /// A JPEG carrying an embedded preview, built rather than stored: all that matters is that a
+    /// preview is present and large enough, and making one keeps a binary fixture out of the repo.
+    fn jpeg_with_embedded_preview() -> Vec<u8> {
+        let preview = {
+            let image = DynamicImage::new_rgb8(MIN_EMBEDDED_SIZE, MIN_EMBEDDED_SIZE);
+            let mut bytes = vec![];
+            JpegEncoder::new_with_quality(&mut bytes, 80)
+                .encode_image(&image.to_rgb8())
+                .expect("the preview has to encode");
+            bytes
+        };
+
+        /* A TIFF structure holding an empty IFD0 and an IFD1 whose two tags say where the preview
+         * is. Offsets are counted from the start of this structure. */
+        let mut tiff = b"II\x2a\x00".to_vec();
+        tiff.extend_from_slice(&8u32.to_le_bytes());
+        let ifd1_offset: u32 = 8 + 2 + 4;
+        tiff.extend_from_slice(&0u16.to_le_bytes());
+        tiff.extend_from_slice(&ifd1_offset.to_le_bytes());
+
+        let entries: u16 = 2;
+        let preview_offset = ifd1_offset + 2 + u32::from(entries) * 12 + 4;
+        tiff.extend_from_slice(&entries.to_le_bytes());
+        for (tag, value) in [
+            (0x0201u16, preview_offset),
+            (0x0202u16, preview.len() as u32),
+        ] {
+            tiff.extend_from_slice(&tag.to_le_bytes());
+            tiff.extend_from_slice(&4u16.to_le_bytes()); /* LONG */
+            tiff.extend_from_slice(&1u32.to_le_bytes());
+            tiff.extend_from_slice(&value.to_le_bytes());
+        }
+        tiff.extend_from_slice(&0u32.to_le_bytes());
+        tiff.extend_from_slice(&preview);
+
+        let mut app1 = b"Exif\x00\x00".to_vec();
+        app1.extend_from_slice(&tiff);
+
+        let mut jpeg = vec![0xFF, 0xD8];
+        jpeg.extend_from_slice(&[0xFF, 0xE1]);
+        jpeg.extend_from_slice(&((app1.len() + 2) as u16).to_be_bytes());
+        jpeg.extend_from_slice(&app1);
+        /* Deliberately no image data: nothing on this path ever decodes the photo itself, and a
+         * file that cannot be decoded proves it */
+        jpeg.extend_from_slice(&[0xFF, 0xD9]);
+        jpeg
+    }
+
+    #[test]
+    fn a_preview_is_found_in_the_start_of_a_photo() {
+        let photo = jpeg_with_embedded_preview();
+
+        let thumbnail = render_embedded(&photo);
+
+        assert!(
+            thumbnail.is_some(),
+            "the preview is right there in the bytes given"
+        );
+        assert!(img::load_from_memory(&thumbnail.unwrap()).is_ok());
+    }
+
+    #[test]
+    fn a_photo_without_a_preview_reports_that_rather_than_decoding() {
+        assert!(
+            render_embedded(TEST_JPEG).is_none(),
+            "this path must never fall back to decoding; the caller decides"
+        );
+    }
+
+    /// The point of the whole arrangement: when the start of the file holds a usable preview, the
+    /// rest of it is never fetched. That is the difference between a gallery tile costing a
+    /// hundred kilobytes and costing several megabytes.
+    #[test]
+    fn a_photo_with_a_preview_is_not_downloaded_in_full() {
+        let thumbnails = Thumbnails::new(1024 * 1024);
+        let photo = Bytes::from(jpeg_with_embedded_preview());
+        let wholes = AtomicUsize::new(0);
+
+        let result = thumbnails.get(
+            "a.jpg",
+            || Ok(photo.clone()),
+            || {
+                wholes.fetch_add(1, Ordering::Relaxed);
+                Ok(photo.clone())
+            },
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(
+            wholes.load(Ordering::Relaxed),
+            0,
+            "the preview was there, so the rest of the photo must not have been fetched"
+        );
+    }
+
+    /// Reading part of a file asks more of a server than reading all of it, and one of them
+    /// answered an abort in a way that left the session confused. A tile that cannot take the
+    /// quick path has to fall back, not break.
+    #[test]
+    fn a_failed_head_read_falls_back_to_the_whole_photo() {
+        let thumbnails = Thumbnails::new(1024 * 1024);
+        let wholes = AtomicUsize::new(0);
+
+        let result = thumbnails.get(
+            "a.jpg",
+            || Err(anyhow::anyhow!("the server did not like being interrupted")),
+            || {
+                wholes.fetch_add(1, Ordering::Relaxed);
+                Ok(Bytes::from_static(TEST_JPEG))
+            },
+        );
+
+        assert!(result.is_ok(), "the thumbnail still has to be produced");
+        assert_eq!(wholes.load(Ordering::Relaxed), 1, "by the ordinary route");
+    }
+
+    #[test]
+    fn a_photo_without_a_preview_is_downloaded_in_full() {
+        let thumbnails = Thumbnails::new(1024 * 1024);
+        let heads = AtomicUsize::new(0);
+        let wholes = AtomicUsize::new(0);
+
+        thumbnails
+            .get(
+                "a.jpg",
+                || {
+                    heads.fetch_add(1, Ordering::Relaxed);
+                    Ok(Bytes::from_static(TEST_JPEG))
+                },
+                || {
+                    wholes.fetch_add(1, Ordering::Relaxed);
+                    Ok(Bytes::from_static(TEST_JPEG))
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            heads.load(Ordering::Relaxed),
+            1,
+            "the start is always tried"
+        );
+        assert_eq!(wholes.load(Ordering::Relaxed), 1, "and then the whole file");
+    }
+
     #[test]
     fn cache_returns_a_stored_thumbnail_without_loading_it_again() {
         let thumbnails = Thumbnails::new(1024 * 1024);
         let loads = AtomicUsize::new(0);
-        let load = || {
+        let count = || {
             loads.fetch_add(1, Ordering::Relaxed);
             Ok(Bytes::from_static(TEST_JPEG))
         };
 
-        let first = thumbnails.get("a.jpg", load).unwrap();
-        let second = thumbnails.get("a.jpg", load).unwrap();
+        let first = thumbnails.get("a.jpg", count, count).unwrap();
+        let before = loads.load(Ordering::Relaxed);
+        let second = thumbnails.get("a.jpg", count, count).unwrap();
 
         assert_eq!(first, second);
         assert_eq!(
             loads.load(Ordering::Relaxed),
-            1,
-            "the photo was downloaded twice"
+            before,
+            "the second request downloaded something instead of using the cache"
         );
     }
 
@@ -323,16 +517,20 @@ mod tests {
     fn cache_renders_again_after_a_photo_was_forgotten() {
         let thumbnails = Thumbnails::new(1024 * 1024);
         let loads = AtomicUsize::new(0);
-        let load = || {
+        let count = || {
             loads.fetch_add(1, Ordering::Relaxed);
             Ok(Bytes::from_static(TEST_JPEG))
         };
 
-        thumbnails.get("a.jpg", load).unwrap();
+        thumbnails.get("a.jpg", count, count).unwrap();
+        let before = loads.load(Ordering::Relaxed);
         thumbnails.forget("a.jpg");
-        thumbnails.get("a.jpg", load).unwrap();
+        thumbnails.get("a.jpg", count, count).unwrap();
 
-        assert_eq!(loads.load(Ordering::Relaxed), 2);
+        assert!(
+            loads.load(Ordering::Relaxed) > before,
+            "a forgotten photo has to be fetched again"
+        );
     }
 
     #[test]
@@ -377,9 +575,9 @@ mod tests {
     fn forget_under_drops_every_preview_below_the_directory() {
         let thumbnails = Thumbnails::new(1024 * 1024);
         let load = || Ok(Bytes::from_static(TEST_JPEG));
-        thumbnails.get("summer/a.jpg", load).unwrap();
-        thumbnails.get("summer/beach/b.jpg", load).unwrap();
-        thumbnails.get("winter/c.jpg", load).unwrap();
+        thumbnails.get("summer/a.jpg", load, load).unwrap();
+        thumbnails.get("summer/beach/b.jpg", load, load).unwrap();
+        thumbnails.get("winter/c.jpg", load, load).unwrap();
 
         thumbnails.forget_under("summer");
 
