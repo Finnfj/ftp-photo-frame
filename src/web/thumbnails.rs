@@ -7,7 +7,10 @@
 
 use std::{
     collections::VecDeque,
+    fs,
     io::Cursor,
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicUsize, Ordering as AtomicOrdering},
     sync::{Mutex, MutexGuard, PoisonError},
 };
 
@@ -32,13 +35,28 @@ const JPEG_QUALITY: u8 = 75;
 /// Rendered previews, kept until the budget is used up
 pub struct Thumbnails {
     cache: Mutex<Cache>,
+    /// [None] when nothing is kept across restarts, which is every build that has nowhere to put
+    /// it. The memory cache sits in front of this either way.
+    disk: Option<DiskCache>,
 }
 
 impl Thumbnails {
     pub fn new(budget: usize) -> Self {
         Self {
             cache: Mutex::new(Cache::new(budget)),
+            disk: None,
         }
+    }
+
+    /// Keeps rendered previews in `directory`, so that a restart does not throw away work that
+    /// cost a download each. On this album 43 photos in 99 carry no embedded preview and have to
+    /// be fetched whole, about a second apiece; paying that once rather than once per restart is
+    /// the whole point.
+    pub fn with_disk_cache(mut self, directory: PathBuf, budget: u64) -> Self {
+        let disk = DiskCache::new(directory, budget);
+        disk.prune();
+        self.disk = Some(disk);
+        self
     }
 
     /// The preview of a photo, rendering it if it has not been asked for recently.
@@ -52,6 +70,10 @@ impl Thumbnails {
         load_all: impl FnOnce() -> Result<Bytes>,
     ) -> Result<Bytes> {
         if let Some(cached) = self.lock().take_recent(key) {
+            return Ok(cached);
+        }
+        if let Some(cached) = self.disk.as_ref().and_then(|disk| disk.read(key)) {
+            self.lock().insert(key.to_string(), cached.clone());
             return Ok(cached);
         }
         /* Nearly every photo carries a preview in its first few kilobytes, and rendering from it
@@ -76,6 +98,9 @@ impl Thumbnails {
             }
         };
         let thumbnail = Bytes::from(thumbnail);
+        if let Some(disk) = &self.disk {
+            disk.write(key, &thumbnail);
+        }
         self.lock().insert(key.to_string(), thumbnail.clone());
         Ok(thumbnail)
     }
@@ -89,15 +114,171 @@ impl Thumbnails {
     /// invalidate whole subtrees, not just the photo named.
     pub fn forget(&self, key: &str) {
         self.lock().remove(key);
+        if let Some(disk) = &self.disk {
+            disk.remove(key);
+        }
     }
 
     /// Drops the previews of everything that was under a directory that is gone.
     pub fn forget_under(&self, directory: &str) {
-        self.lock().remove_under(&format!("{directory}/"));
+        let prefix = format!("{directory}/");
+        self.lock().remove_under(&prefix);
+        if let Some(disk) = &self.disk {
+            disk.remove_under(&prefix);
+        }
     }
 
     fn lock(&self) -> MutexGuard<'_, Cache> {
         self.cache.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// Characters that cannot be part of a file name, or that would make the escaping ambiguous.
+///
+/// Everything else is left alone, so a thumbnail's file is named after the photo it belongs to and
+/// the cache can be read by a human wondering what is in it.
+const ESCAPED_IN_FILE_NAMES: &percent_encoding::AsciiSet =
+    &percent_encoding::CONTROLS.add(b'%').add(b'/');
+
+/// A file name longer than this is refused by some filesystems, and a photo buried that deep is
+/// not worth special handling: it is cached in memory like everything else, just not on disk.
+const LONGEST_FILE_NAME: usize = 200;
+
+/// How many writes go by before the directory is measured again. Pruning reads the whole
+/// directory, which is cheap but not free, and the budget is a limit rather than a promise.
+const WRITES_BETWEEN_PRUNES: usize = 128;
+
+/// Rendered previews kept as files, so a restart does not throw the work away.
+///
+/// Every operation here is best-effort: a cache that cannot be read or written is a slower frame,
+/// never a broken one, so failures are logged and otherwise ignored.
+struct DiskCache {
+    directory: PathBuf,
+    budget: u64,
+    writes: AtomicUsize,
+}
+
+impl DiskCache {
+    fn new(directory: PathBuf, budget: u64) -> Self {
+        Self {
+            directory,
+            budget,
+            writes: AtomicUsize::new(0),
+        }
+    }
+
+    /// The file a photo's thumbnail belongs in, or [None] when its path cannot be one.
+    ///
+    /// The photo's own path is the name, with the two characters that cannot appear in one
+    /// escaped. Keeping the path recoverable is what lets a deleted directory's thumbnails be
+    /// found again by their prefix, which a hash would not allow.
+    fn file_for(&self, key: &str) -> Option<PathBuf> {
+        let name = percent_encoding::utf8_percent_encode(key, ESCAPED_IN_FILE_NAMES).to_string();
+        (name.len() <= LONGEST_FILE_NAME).then(|| self.directory.join(name))
+    }
+
+    fn key_of(file: &Path) -> Option<String> {
+        let name = file.file_name()?.to_str()?;
+        Some(
+            percent_encoding::percent_decode_str(name)
+                .decode_utf8()
+                .ok()?
+                .into_owned(),
+        )
+    }
+
+    fn read(&self, key: &str) -> Option<Bytes> {
+        let file = self.file_for(key)?;
+        match fs::read(&file) {
+            Ok(bytes) => Some(Bytes::from(bytes)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                log::debug!("Could not read {}: {error}", file.display());
+                None
+            }
+        }
+    }
+
+    fn write(&self, key: &str, thumbnail: &[u8]) {
+        let Some(file) = self.file_for(key) else {
+            return;
+        };
+        if let Err(error) = fs::create_dir_all(&self.directory) {
+            log::debug!("Could not make {}: {error}", self.directory.display());
+            return;
+        }
+        /* Written beside the real name and moved onto it, so that a frame stopped mid-write never
+         * leaves behind half a thumbnail that would be served as if it were whole */
+        let partial = file.with_extension("partial");
+        if let Err(error) =
+            fs::write(&partial, thumbnail).and_then(|()| fs::rename(&partial, &file))
+        {
+            log::debug!("Could not keep {}: {error}", file.display());
+            let _ = fs::remove_file(&partial);
+            return;
+        }
+        if self
+            .writes
+            .fetch_add(1, AtomicOrdering::Relaxed)
+            .is_multiple_of(WRITES_BETWEEN_PRUNES)
+        {
+            self.prune();
+        }
+    }
+
+    fn remove(&self, key: &str) {
+        if let Some(file) = self.file_for(key) {
+            let _ = fs::remove_file(file);
+        }
+    }
+
+    fn remove_under(&self, prefix: &str) {
+        for file in self.files() {
+            if Self::key_of(&file).is_some_and(|key| key.starts_with(prefix)) {
+                let _ = fs::remove_file(file);
+            }
+        }
+    }
+
+    fn files(&self) -> Vec<PathBuf> {
+        match fs::read_dir(&self.directory) {
+            Ok(entries) => entries.flatten().map(|entry| entry.path()).collect(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => vec![],
+            Err(error) => {
+                log::debug!("Could not list {}: {error}", self.directory.display());
+                vec![]
+            }
+        }
+    }
+
+    /// Drops the oldest thumbnails until the directory is within its budget.
+    ///
+    /// By the time they were written rather than the time they were last wanted: keeping a read
+    /// time would mean writing to the disk every time a page is opened, which is the thing this
+    /// cache exists to avoid.
+    fn prune(&self) {
+        let mut files: Vec<(PathBuf, u64, std::time::SystemTime)> = self
+            .files()
+            .into_iter()
+            .filter_map(|path| {
+                let data = fs::metadata(&path).ok()?;
+                Some((path, data.len(), data.modified().ok()?))
+            })
+            .collect();
+        let mut total: u64 = files.iter().map(|(_, size, _)| size).sum();
+        if total <= self.budget {
+            return;
+        }
+        files.sort_by_key(|(_, _, written)| *written);
+        for (path, size, _) in files {
+            if total <= self.budget {
+                break;
+            }
+            if fs::remove_file(&path).is_ok() {
+                total = total.saturating_sub(size);
+            }
+        }
+        log::debug!("Pruned the thumbnail cache to {total} bytes");
     }
 }
 
@@ -569,6 +750,143 @@ mod tests {
         cache.insert("a".to_string(), Bytes::from_static(b"12345"));
 
         assert_eq!(cache.used, 5);
+    }
+
+    /* Kept on disk */
+
+    fn temporary_directory(name: &str) -> PathBuf {
+        let directory = std::env::temp_dir().join(format!(
+            "syno-photo-frame-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).expect("a temporary directory has to be creatable");
+        directory
+    }
+
+    /// The reason the disk cache exists: a frame restarts, and the photos that have to be fetched
+    /// whole cost about a second each. Paying that once rather than once per restart is the point.
+    #[test]
+    fn a_thumbnail_survives_a_restart() {
+        let directory = temporary_directory("restart");
+        let first = Thumbnails::new(1024 * 1024).with_disk_cache(directory.clone(), 1024 * 1024);
+        first
+            .get(
+                "holiday/a.jpg",
+                || Ok(Bytes::from_static(TEST_JPEG)),
+                || Ok(Bytes::from_static(TEST_JPEG)),
+            )
+            .unwrap();
+
+        /* A second instance over the same directory is what a restart looks like */
+        let second = Thumbnails::new(1024 * 1024).with_disk_cache(directory.clone(), 1024 * 1024);
+        let loads = AtomicUsize::new(0);
+        let count = || {
+            loads.fetch_add(1, Ordering::Relaxed);
+            Ok(Bytes::from_static(TEST_JPEG))
+        };
+        let thumbnail = second.get("holiday/a.jpg", count, count).unwrap();
+
+        assert!(!thumbnail.is_empty());
+        assert_eq!(
+            loads.load(Ordering::Relaxed),
+            0,
+            "it was on disk, so nothing should have been downloaded"
+        );
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn forgetting_a_photo_removes_its_file() {
+        let directory = temporary_directory("forget");
+        let thumbnails =
+            Thumbnails::new(1024 * 1024).with_disk_cache(directory.clone(), 1024 * 1024);
+        let load = || Ok(Bytes::from_static(TEST_JPEG));
+        thumbnails.get("a.jpg", load, load).unwrap();
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
+
+        thumbnails.forget("a.jpg");
+
+        assert_eq!(
+            fs::read_dir(&directory).unwrap().count(),
+            0,
+            "a deleted photo must not leave a preview behind to be served for the next one that
+             takes its name"
+        );
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn forgetting_a_directory_removes_what_was_under_it() {
+        let directory = temporary_directory("forget-under");
+        let thumbnails =
+            Thumbnails::new(1024 * 1024).with_disk_cache(directory.clone(), 1024 * 1024);
+        let load = || Ok(Bytes::from_static(TEST_JPEG));
+        thumbnails.get("summer/a.jpg", load, load).unwrap();
+        thumbnails.get("summer/beach/b.jpg", load, load).unwrap();
+        thumbnails.get("summertime/c.jpg", load, load).unwrap();
+
+        thumbnails.forget_under("summer");
+
+        let left: Vec<String> = fs::read_dir(&directory)
+            .unwrap()
+            .flatten()
+            .filter_map(|entry| DiskCache::key_of(&entry.path()))
+            .collect();
+        assert_eq!(
+            left,
+            vec!["summertime/c.jpg".to_string()],
+            "only the directory asked for, and the prefix has to end at a boundary"
+        );
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    /// A path can be longer than a file name is allowed to be. Such a photo is simply not kept on
+    /// disk; it is a photo like any other, only slower.
+    #[test]
+    fn a_path_too_long_for_a_file_name_is_not_kept_on_disk() {
+        let directory = temporary_directory("long");
+        let disk = DiskCache::new(directory.clone(), 1024 * 1024);
+        let long = format!("{}.jpg", "a".repeat(LONGEST_FILE_NAME));
+
+        assert!(disk.file_for("short.jpg").is_some());
+        assert!(disk.file_for(&long).is_none());
+
+        disk.write(&long, b"something");
+        assert_eq!(
+            fs::read_dir(&directory).unwrap().count(),
+            0,
+            "nothing should have been written"
+        );
+        assert!(disk.read(&long).is_none());
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn pruning_brings_the_cache_back_within_its_budget() {
+        let directory = temporary_directory("prune");
+        let disk = DiskCache::new(directory.clone(), 100);
+        for name in ["a.jpg", "b.jpg", "c.jpg"] {
+            disk.write(name, &[0u8; 60]);
+            /* The oldest go first, and the timestamps have to differ for that to mean anything */
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        disk.prune();
+
+        let total: u64 = fs::read_dir(&directory)
+            .unwrap()
+            .flatten()
+            .filter_map(|entry| entry.metadata().ok())
+            .map(|data| data.len())
+            .sum();
+        assert!(total <= 100, "still {total} bytes, over the budget of 100");
+        assert!(
+            disk.read("c.jpg").is_some(),
+            "the newest has to be the one that survives"
+        );
+        let _ = fs::remove_dir_all(&directory);
     }
 
     #[test]

@@ -240,11 +240,27 @@ fn start_web_app<T: crate::ftp::FtpTransport>(
         Duration::from_secs(cli.timeout_seconds.into()),
         refresh.clone(),
         diagnostics,
+        thumbnail_cache_directory(),
     );
     thread::Builder::new()
         .name("web".to_string())
         .spawn(move || web::serve(server, state))?;
     Ok(Some(refresh))
+}
+
+/// Where rendered previews are kept between runs, or [None] when there is nowhere to put them.
+///
+/// The usual cache location, so that it is somewhere a person would think to look and somewhere a
+/// system is willing to throw away. Nothing here is worth keeping if the machine would rather have
+/// the space: every file in it can be made again from the album.
+#[cfg(feature = "web")]
+fn thumbnail_cache_directory() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".cache"))
+        })?;
+    Some(base.join("syno-photo-frame").join("thumbnails"))
 }
 
 #[cfg(not(feature = "web"))]

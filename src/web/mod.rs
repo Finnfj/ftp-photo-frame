@@ -35,6 +35,10 @@ pub const MAX_UPLOAD_BYTES: u64 = 64 * 1024 * 1024;
 /// How much memory rendered thumbnails may take up together
 const THUMBNAIL_CACHE_BYTES: usize = 32 * 1024 * 1024;
 
+/// What the previews kept on disk may take up. A preview is tens of kilobytes, so this is room
+/// for thousands of them, and the oldest go when it is reached.
+const THUMBNAIL_DISK_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Everything the serving thread needs, built before it is spawned so that nothing borrows the
 /// command line
 pub fn state(
@@ -43,11 +47,17 @@ pub fn state(
     timeout: Duration,
     refresh: Refresh,
     diagnostics: Arc<Diagnostics>,
+    thumbnail_cache: Option<std::path::PathBuf>,
 ) -> AppState<SuppaFtpTransport> {
+    let mut thumbnails = Thumbnails::new(THUMBNAIL_CACHE_BYTES);
+    if let Some(directory) = thumbnail_cache {
+        log::info!("Keeping rendered previews in {}", directory.display());
+        thumbnails = thumbnails.with_disk_cache(directory, THUMBNAIL_DISK_BYTES);
+    }
     AppState {
         config,
         files: FtpFiles::new(session, SuppaFtpTransport::new(timeout), refresh),
-        thumbnails: Thumbnails::new(THUMBNAIL_CACHE_BYTES),
+        thumbnails,
         diagnostics,
     }
 }
