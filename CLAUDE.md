@@ -21,3 +21,6 @@ See `docs/agents/triage-labels.md`.
 
 Single-context: `GLOSSARY.md` and `docs/adr/` at the repo root, both created lazily.
 See `docs/agents/domain.md`.
+
+`docs/research/` holds evidence gathered before a decision: notes that cite primary sources
+and decide nothing. An ADR decides; a research note is what it was decided against.
