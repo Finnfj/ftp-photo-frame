@@ -59,6 +59,7 @@ mod asset;
 mod img;
 mod info_box;
 mod metadata;
+pub mod mirror;
 mod rand;
 mod slideshow;
 mod transition;
@@ -167,8 +168,12 @@ where
     match backend {
         Backend::Synology => slideshow_loop(
             cli,
-            SynoApiClient::build(http_client, cookie_store, &cli.share_link)?
-                .with_password(&cli.password),
+            mirrored(
+                cli,
+                SynoApiClient::build(http_client, cookie_store, &cli.share_link)?
+                    .with_password(&cli.password),
+                &diagnostics,
+            )?,
             sdl,
             random,
             update_check_receiver,
@@ -180,7 +185,11 @@ where
         ),
         Backend::Immich => slideshow_loop(
             cli,
-            ImmichApiClient::build(http_client, &cli.share_link)?.with_password(&cli.password),
+            mirrored(
+                cli,
+                ImmichApiClient::build(http_client, &cli.share_link)?.with_password(&cli.password),
+                &diagnostics,
+            )?,
             sdl,
             random,
             update_check_receiver,
@@ -197,9 +206,11 @@ where
             )?
             .with_password(&cli.password);
             let refresh = start_web_app(cli, &api_client, Arc::clone(&diagnostics))?;
+            /* The web app keeps talking to the server: it exists to change what is in the album,
+             * which the mirror cannot do. Only the slideshow is moved onto the mirror. */
             slideshow_loop(
                 cli,
-                api_client,
+                mirrored(cli, api_client, &diagnostics)?,
                 sdl,
                 random,
                 update_check_receiver,
@@ -261,6 +272,45 @@ fn thumbnail_cache_directory() -> Option<std::path::PathBuf> {
             std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".cache"))
         })?;
     Some(base.join("syno-photo-frame").join("thumbnails"))
+}
+
+/// Where the mirrored album lives when `--mirror-dir` was not given.
+///
+/// The data directory rather than the cache directory, on purpose: the mirror is the copy that
+/// keeps the frame working when the server is away, and the XDG specification lets anything delete
+/// a cache at any time. The thumbnails above are cache; this is not.
+fn mirror_directory() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("XDG_DATA_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(|home| std::path::PathBuf::from(home).join(".local").join("share"))
+        })?;
+    Some(base.join("syno-photo-frame").join("album"))
+}
+
+/// Wraps a backend in the local mirror, so that the slideshow reads photos from disk and has no
+/// route to the server at all. See [mirror] and ADR 0002.
+fn mirrored<A: api_client::ApiClient>(
+    cli: &Cli,
+    api_client: A,
+    diagnostics: &Arc<Diagnostics>,
+) -> Result<mirror::Mirror<A>> {
+    let directory = cli
+        .mirror_directory
+        .clone()
+        .or_else(mirror_directory)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Nowhere to keep the mirrored album: neither --mirror-dir nor XDG_DATA_HOME nor                  HOME is set."
+            )
+        })?;
+    let policy = mirror::Policy {
+        sync_interval: Duration::from_secs(u64::from(cli.sync_interval_minutes) * 60),
+        ..mirror::Policy::default()
+    };
+    Ok(mirror::Mirror::open(api_client, &directory, policy)?
+        .with_diagnostics(Some(Arc::clone(diagnostics))))
 }
 
 #[cfg(not(feature = "web"))]
@@ -549,6 +599,21 @@ mod tests {
     /// setting the initial last_change does not underflow
     const START_TIME: Duration = Duration::from_secs(30);
 
+    /// A mirror directory of this test's own.
+    ///
+    /// Without one, [run] would mirror the album into the real `XDG_DATA_HOME`, which is both a
+    /// surprise for whoever runs the tests and a way for one test to see another's photos -- a
+    /// login-failure test passed or failed depending on what an earlier run had left behind.
+    fn with_own_mirror(cli_command: &str) -> String {
+        let directory = std::env::temp_dir().join(format!(
+            "syno-photo-frame-run-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        format!("{cli_command} --mirror-dir {}", directory.display())
+    }
+
     #[test]
     fn when_login_fails_with_api_error_then_loop_terminates() {
         const SHARE_LINK: &str = "http://fake.dsm.addr/aa/sharing/FakeSharingId";
@@ -592,7 +657,7 @@ mod tests {
         );
 
         let result = run(
-            &Cli::parse_from(cli_command.split(' ')),
+            &Cli::parse_from(with_own_mirror(&cli_command).split(' ')),
             (&client_stub, &Jar::default()),
             &mut sdl_stub,
             FakeRandom::default(),
@@ -632,7 +697,7 @@ mod tests {
         );
 
         let result = run(
-            &Cli::parse_from(cli_command.split(' ')),
+            &Cli::parse_from(with_own_mirror(&cli_command).split(' ')),
             (&client_stub, &Jar::default()),
             &mut sdl_stub,
             FakeRandom::default(),
@@ -727,7 +792,7 @@ mod tests {
 
         // let _ = SimpleLogger::new().init(); /* cargo test -- --show-output */
         let result = run(
-            &Cli::parse_from(cli_command.split(' ')),
+            &Cli::parse_from(with_own_mirror(&cli_command).split(' ')),
             (&client_stub, &Jar::default()),
             &mut sdl_stub,
             FakeRandom::default(),
@@ -825,7 +890,7 @@ mod tests {
 
         // let _ = SimpleLogger::new().init(); /* cargo test -- --show-output */
         let result = run(
-            &Cli::parse_from(cli_command.split(' ')),
+            &Cli::parse_from(with_own_mirror(&cli_command).split(' ')),
             (&client_stub, &Jar::default()),
             &mut sdl_stub,
             FakeRandom::default(),
@@ -852,7 +917,7 @@ mod tests {
              --web-password hunter2hunter2";
 
         let result = run(
-            &Cli::parse_from(cli_command.split_whitespace()),
+            &Cli::parse_from(with_own_mirror(cli_command).split_whitespace()),
             (&MockHttpClient::new(), &Jar::default()),
             &mut sdl_stub,
             FakeRandom::default(),
@@ -1026,7 +1091,7 @@ mod tests {
          * run returns instead of spinning for ever. */
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             run(
-                &Cli::parse_from(cli_command.split_whitespace()),
+                &Cli::parse_from(with_own_mirror(&cli_command).split_whitespace()),
                 (&client_stub, &Jar::default()),
                 &mut sdl_stub,
                 FakeRandom::default(),
@@ -1081,7 +1146,7 @@ mod tests {
         );
 
         run(
-            &Cli::parse_from(cli_command.split_whitespace()),
+            &Cli::parse_from(with_own_mirror(&cli_command).split_whitespace()),
             (&client_stub, &Jar::default()),
             sdl,
             FakeRandom::default(),

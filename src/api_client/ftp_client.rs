@@ -6,7 +6,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use percent_encoding::percent_decode_str;
 
 use crate::{
-    api_client::{ApiClient, LoginError, PhotoNotFound, SortBy},
+    api_client::{ApiClient, LoginError, PhotoFacts, PhotoNotFound, SortBy},
     cli::SourceSize,
     ftp::{
         Credentials, EntryKind, FtpAddress, FtpTransport, InvalidFtpResponse, check_tls_supported,
@@ -226,6 +226,15 @@ impl<T: FtpTransport> ApiClient for FtpApiClient<T> {
         self.last_photo
             .replace(Some((photo.path.clone(), bytes.clone())));
         Ok(bytes)
+    }
+
+    /// The path identifies the photo, and the modification time the server reported in the listing
+    /// is the only change signal FTP offers without fetching the file.
+    fn photo_facts(&self, photo: &Self::Photo) -> PhotoFacts {
+        PhotoFacts {
+            key: photo.path.clone(),
+            fingerprint: photo.modified.map(|modified| modified.to_rfc3339()),
+        }
     }
 }
 

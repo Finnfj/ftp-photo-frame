@@ -35,6 +35,169 @@ mock! {
     }
 }
 
+/// A backend standing in for a real server, for testing [crate::mirror].
+///
+/// A hand-written fake rather than a mockall mock because [crate::api_client::ApiClient::get_exif]
+/// returns a `-> Result<impl Metadata>`, which mockall cannot express. The mocks elsewhere in this
+/// crate sit on the transport traits, which have no such return.
+///
+/// It says the things a mirror has to cope with: the album changed, the listing failed, the
+/// transfer came back short, this photo always fails.
+pub mod api {
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+
+    use anyhow::{Result, anyhow, bail};
+    use bytes::Bytes;
+    use chrono::{DateTime, TimeZone, Utc};
+
+    use crate::{
+        api_client::{ApiClient, LoginError, PhotoFacts, SortBy},
+        cli::SourceSize,
+        metadata::{Location, Metadata},
+    };
+
+    /// A real, decodable JPEG, so that the mirror's "did this arrive whole" check sees a photo
+    pub const PHOTO: &[u8] = include_bytes!("../../assets/test_loading.jpeg");
+
+    #[derive(Clone, Debug)]
+    pub struct FakePhoto {
+        pub key: String,
+        pub fingerprint: Option<String>,
+    }
+
+    impl FakePhoto {
+        pub fn new(key: &str) -> Self {
+            Self {
+                key: key.to_string(),
+                fingerprint: Some("v1".to_string()),
+            }
+        }
+
+        pub fn with_fingerprint(mut self, fingerprint: &str) -> Self {
+            self.fingerprint = Some(fingerprint.to_string());
+            self
+        }
+    }
+
+    #[derive(Default)]
+    pub struct FakeApiClient {
+        album: Mutex<Vec<FakePhoto>>,
+        /// Photos whose download comes back as these bytes instead of a whole photo
+        broken: Mutex<Vec<(String, Bytes)>>,
+        pub listing_fails: AtomicBool,
+        pub login_fails: AtomicBool,
+        pub downloads: AtomicUsize,
+        pub listings: AtomicUsize,
+    }
+
+    impl FakeApiClient {
+        pub fn with_album(keys: &[&str]) -> Self {
+            let client = Self::default();
+            client.set_album(keys);
+            client
+        }
+
+        pub fn set_album(&self, keys: &[&str]) {
+            *self.album.lock().unwrap() = keys.iter().map(|key| FakePhoto::new(key)).collect();
+        }
+
+        pub fn set_photos(&self, photos: Vec<FakePhoto>) {
+            *self.album.lock().unwrap() = photos;
+        }
+
+        /// Makes one photo come back as something other than a whole image
+        pub fn breaks(&self, key: &str, bytes: &'static [u8]) {
+            self.broken
+                .lock()
+                .unwrap()
+                .push((key.to_string(), Bytes::from_static(bytes)));
+        }
+
+        pub fn downloads(&self) -> usize {
+            self.downloads.load(Ordering::Relaxed)
+        }
+
+        pub fn listings(&self) -> usize {
+            self.listings.load(Ordering::Relaxed)
+        }
+    }
+
+    pub struct FakeMetadata;
+
+    impl Metadata for FakeMetadata {
+        fn date(&self) -> DateTime<Utc> {
+            Utc.with_ymd_and_hms(2026, 5, 1, 12, 0, 0).unwrap()
+        }
+
+        fn location(&self) -> Location {
+            Location::new(Some("Somewhere".to_string()), None)
+        }
+    }
+
+    impl ApiClient for FakeApiClient {
+        type Photo = FakePhoto;
+
+        fn is_logged_in(&self) -> bool {
+            !self.login_fails.load(Ordering::Relaxed)
+        }
+
+        fn login(&self) -> Result<(), LoginError> {
+            if self.login_fails.load(Ordering::Relaxed) {
+                Err(LoginError(anyhow!("the server refused the login")))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn get_photo_metadata(&self, _: SortBy) -> Result<Vec<Self::Photo>> {
+            self.listings.fetch_add(1, Ordering::Relaxed);
+            if self.listing_fails.load(Ordering::Relaxed) {
+                /* An error, never an empty list. The mirror's deletion policy rests on this
+                 * distinction, so the fake has to honour it the way a backend does. */
+                bail!("the server did not answer")
+            }
+            Ok(self.album.lock().unwrap().clone())
+        }
+
+        fn get_exif(&self, _: &Self::Photo) -> Result<impl Metadata> {
+            Ok(FakeMetadata)
+        }
+
+        fn get_photo_bytes(&self, photo: &Self::Photo, _: SourceSize) -> Result<Bytes> {
+            self.downloads.fetch_add(1, Ordering::Relaxed);
+            if let Some((_, bytes)) = self
+                .broken
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(key, _)| *key == photo.key)
+            {
+                return Ok(bytes.clone());
+            }
+            if !self
+                .album
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|known| known.key == photo.key)
+            {
+                bail!("{} is not in the album any more", photo.key)
+            }
+            Ok(Bytes::from_static(PHOTO))
+        }
+
+        fn photo_facts(&self, photo: &Self::Photo) -> PhotoFacts {
+            PhotoFacts {
+                key: photo.key.clone(),
+                fingerprint: photo.fingerprint.clone(),
+            }
+        }
+    }
+}
+
 pub mod rand {
     use crate::rand::Random;
     use std::cell::RefCell;

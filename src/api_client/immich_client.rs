@@ -9,7 +9,7 @@ use serde_json::json;
 use crate::{
     LoginError,
     api_client::{
-        ApiClient, PhotoNotFoundMapper, SharingId, SortBy,
+        ApiClient, PhotoFacts, PhotoNotFoundMapper, SharingId, SortBy,
         immich_client::dto::{
             AlbumResponseDto, AssetResponseDto, ExifResponseDto, GetAlbumInfoResponseDto,
             GetAssetInfoResponseDto, GetServerVersionResponseDto, SearchAssetResponseDto,
@@ -84,6 +84,15 @@ impl<H: HttpClient> ApiClient for ImmichApiClient<'_, H> {
             ],
         )?;
         read_response(response, HttpResponse::bytes).map_photo_not_found()
+    }
+
+    /// The asset identifier names the photo; its thumbhash is derived from the image itself, so it
+    /// moves when the contents do.
+    fn photo_facts(&self, photo: &Self::Photo) -> PhotoFacts {
+        PhotoFacts {
+            key: photo.id.clone(),
+            fingerprint: Some(photo.thumbhash.clone()),
+        }
     }
 }
 

@@ -34,6 +34,19 @@ pub struct Event {
     pub at: Instant,
 }
 
+/// What the mirror last reported about itself. Carried here rather than read from the mirror
+/// directly because the web app is started before the mirror exists and must not hold it.
+#[derive(Clone, Debug, Default)]
+pub struct MirrorReport {
+    pub held: usize,
+    pub listed: Option<usize>,
+    pub bytes: u64,
+    pub quarantined: usize,
+    pub last_sync_seconds_ago: Option<u64>,
+    pub bulk_guard_tripped: bool,
+    pub out_of_space: bool,
+}
+
 #[derive(Debug, Default)]
 struct State {
     activities: BTreeMap<&'static str, Activity>,
@@ -41,6 +54,7 @@ struct State {
     last_photo_fetched: Option<Event>,
     album_photos: Option<usize>,
     waiting_for_a_photo: bool,
+    mirror: Option<MirrorReport>,
 }
 
 /// Shared by every thread that reports, and by the web app that serves it
@@ -113,6 +127,12 @@ impl Diagnostics {
         state.waiting_for_a_photo = waiting_for_a_photo;
     }
 
+    /// Records what the local copy of the album looks like, so that a frame showing photos from
+    /// disk can say so rather than looking identical to one still talking to its server.
+    pub fn mirror(&self, report: MirrorReport) {
+        self.lock().mirror = Some(report);
+    }
+
     pub fn snapshot(&self) -> Snapshot {
         let now = Instant::now();
         let state = self.lock();
@@ -134,6 +154,7 @@ impl Diagnostics {
                 .map(|event| event.aged(now)),
             album_photos: state.album_photos,
             waiting_for_a_photo: state.waiting_for_a_photo,
+            mirror: state.mirror.clone(),
         }
     }
 
@@ -178,6 +199,7 @@ pub struct Snapshot {
     pub last_photo_fetched: Option<AgedEvent>,
     pub album_photos: Option<usize>,
     pub waiting_for_a_photo: bool,
+    pub mirror: Option<MirrorReport>,
 }
 
 #[cfg(test)]

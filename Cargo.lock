@@ -1902,6 +1902,7 @@ dependencies = [
  "fast_image_resize",
  "image",
  "kamadak-exif",
+ "libc",
  "log",
  "mock_instant",
  "mockall",

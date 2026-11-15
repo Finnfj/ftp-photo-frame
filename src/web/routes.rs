@@ -325,6 +325,15 @@ fn status_json(snapshot: &Snapshot) -> serde_json::Value {
             .last_photo_fetched.as_ref().map(|event| event.ago.as_secs()),
         "album_photos": snapshot.album_photos,
         "waiting_for_a_photo": snapshot.waiting_for_a_photo,
+        "mirror": snapshot.mirror.as_ref().map(|mirror| json!({
+            "photos_held": mirror.held,
+            "photos_listed": mirror.listed,
+            "bytes": mirror.bytes,
+            "quarantined": mirror.quarantined,
+            "last_sync_seconds_ago": mirror.last_sync_seconds_ago,
+            "bulk_guard_tripped": mirror.bulk_guard_tripped,
+            "out_of_space": mirror.out_of_space,
+        })),
     })
 }
 

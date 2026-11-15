@@ -15,7 +15,10 @@ pub mod immich_client;
 pub mod syno_client;
 
 pub trait ApiClient {
-    type Photo: Send;
+    /// [Sync] so that [crate::mirror] can hold a listing behind an [std::sync::Arc] and keep
+    /// fetching from it after the call that produced it has returned. The backend DTOs are plain
+    /// data, so none of them had to change for this.
+    type Photo: Send + Sync;
 
     fn is_logged_in(&self) -> bool;
 
@@ -26,6 +29,30 @@ pub trait ApiClient {
     fn get_exif(&self, photo: &Self::Photo) -> Result<impl Metadata>;
 
     fn get_photo_bytes(&self, photo: &Self::Photo, source_size: SourceSize) -> Result<Bytes>;
+
+    /// What the backend can say about a photo without fetching it: who it is, and whether its
+    /// contents look like they have changed.
+    ///
+    /// Needed by [crate::mirror], which has to name a photo on disk and decide whether the copy it
+    /// already holds is still current. Backends differ in what they can offer, so this is the
+    /// narrowest thing they all have.
+    fn photo_facts(&self, photo: &Self::Photo) -> PhotoFacts;
+}
+
+/// A photo's identity, and the cheapest available signal that its contents changed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PhotoFacts {
+    /// Stable for as long as the photo is the same photo, and usable as a file name once escaped.
+    pub key: String,
+
+    /// Whatever the backend can report without fetching the photo -- a modification time, a size,
+    /// a server-side identifier for the contents. Compared only against an earlier value of
+    /// itself, never interpreted, so each backend is free to choose what goes in it.
+    ///
+    /// [None] where a backend can offer nothing, which means a mirrored copy of that photo is
+    /// taken to be current until the photo leaves the album. Re-downloading an album every pass on
+    /// the chance that something changed is the worse failure.
+    pub fingerprint: Option<String>,
 }
 
 #[derive(Debug)]

@@ -139,6 +139,26 @@ pub struct Cli {
         value_parser = clap::value_parser!(u16).range(5..))]
     pub timeout_seconds: u16,
 
+    /// Where to keep the local copy of the album
+    ///
+    /// The frame shows photos from this copy and never from the server, so an album that is slow,
+    /// busy or unreachable makes no difference to what is on screen. Defaults to
+    /// syno-photo-frame/ under the user's data directory -- deliberately not the cache directory,
+    /// because this copy is the last one standing when the server is away and a cleaner must not
+    /// treat it as scratch.
+    #[arg(long = "mirror-dir", value_name = "DIRECTORY")]
+    pub mirror_directory: Option<std::path::PathBuf>,
+
+    /// How often to look for photos added to or removed from the album, in minutes
+    ///
+    /// Only listings and changed photos cost anything; an album that has not changed costs one
+    /// listing. Lower this to notice changes sooner, raise it to be gentler on a busy server
+    #[arg(
+        long = "sync-interval",
+        default_value_t = 360,
+        value_parser = clap::value_parser!(u32).range(1..))]
+    pub sync_interval_minutes: u32,
+
     /// Requested size of the photo as fetched from the Synology Photos. Can reduce network and CPU
     /// utilization at the cost of image quality. Note: photos are still scaled to full-screen
     /// size. Ignored when using the Immich or FTP backends.

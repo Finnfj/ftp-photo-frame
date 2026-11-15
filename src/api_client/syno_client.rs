@@ -12,7 +12,7 @@ use serde::Deserialize;
 use syno_api::dto::{ApiResponse, List};
 
 use crate::{
-    api_client::{ApiClient, LoginError, PhotoNotFoundMapper, SharingId, SortBy},
+    api_client::{ApiClient, LoginError, PhotoFacts, PhotoNotFoundMapper, SharingId, SortBy},
     cli::SourceSize,
     http::{CookieStore, HttpClient, HttpResponse, InvalidHttpResponse, Query, Url, read_response},
     metadata::{Location, Metadata},
@@ -124,6 +124,22 @@ impl<H: HttpClient, C: CookieStore> ApiClient for SynoApiClient<'_, H, C> {
             .http_client
             .get(self.api_thumbnail_get_url.as_str(), &params)?;
         read_response(response, HttpResponse::bytes).map_photo_not_found()
+    }
+
+    /// The thumbnail's unit identifies the photo, and its cache key is what the server itself uses
+    /// to decide whether a cached rendering is still good -- exactly the question being asked here.
+    fn photo_facts(&self, photo: &Self::Photo) -> PhotoFacts {
+        let thumbnail = photo
+            .additional
+            .as_ref()
+            .and_then(|additional| additional.thumbnail.as_ref());
+        PhotoFacts {
+            key: thumbnail.map_or_else(
+                || photo.id.to_string(),
+                |thumbnail| thumbnail.unit_id.to_string(),
+            ),
+            fingerprint: thumbnail.map(|thumbnail| thumbnail.cache_key.clone()),
+        }
     }
 }
 
